@@ -51,6 +51,30 @@ Sources:
 Loaders live inline in each notebook for now. Promote to `research/lib/` once shared
 across more than one notebook.
 
+### Tardis options-chain fetcher
+
+`research/scripts/tardis_fetch.py` pulls Deribit options_chain snapshots from
+Tardis.dev free tier (first-of-month dates) and writes per-currency Parquet under
+`research/data/tardis/`.
+
+```bash
+# one first-of-month date, BTC+ETH, 1-minute snapshots
+python research/scripts/tardis_fetch.py --date 2024-06-01
+
+# smoke-test pipeline without downloading the full 2.3 GB daily file
+python research/scripts/tardis_fetch.py --date 2024-06-01 --max-rows 200000
+
+# coarser cadence for faster runs
+python research/scripts/tardis_fetch.py --date 2024-06-01 --cadence-sec 300
+```
+
+Output layout: `research/data/tardis/{btc,eth}/{YYYY-MM-DD}/snapshot.parquet`.
+
+Notes:
+- Only first-of-month dates are free; other dates require a Tardis API key.
+- Full day takes ~60-100 min on a single thread (CSV is ~2.3 GB compressed).
+- See `research/scripts/tardis_fetch.py --help` for all flags.
+
 ---
 
 ## Conventions
