@@ -82,6 +82,7 @@ def fetch_currency(
 ) -> pd.DataFrame:
     rows: list[list[float]] = []
     cursor_end = end_ms
+    prev_cursor_end: int | None = None
     page = 0
     while True:
         page += 1
@@ -105,6 +106,17 @@ def fetch_currency(
         )
         if not continuation or continuation <= start_ms or len(data) < PAGE_LIMIT:
             break
+        # Defensive guard against a stale-cursor infinite loop: if the API ever
+        # echoes back the same continuation as the cursor we just used, advance
+        # would never happen and we'd request the same page forever.
+        if continuation == cursor_end or continuation == prev_cursor_end:
+            print(
+                f"  {currency}: WARNING pagination cursor did not advance "
+                f"(continuation={continuation}), breaking",
+                file=sys.stderr,
+            )
+            break
+        prev_cursor_end = cursor_end
         cursor_end = continuation
         time.sleep(sleep_ms / 1000)
 
@@ -134,7 +146,8 @@ def sanity_check(df: pd.DataFrame, currency: str, resolution_sec: int) -> None:
         f"max_gap={max_gap}  n_gaps_>1.5x={n_gaps}",
         file=sys.stderr,
     )
-    # hard checks
+    # Warnings are informational only; exit code stays 0 so callers decide.
+    # For pipeline use, pipe stderr to a log and grep for 'WARNING'.
     if closes.min() < 1 or closes.max() > 500:
         print(f"  {currency}: WARNING close values outside [1, 500] sanity range", file=sys.stderr)
     if max_gap > expected_step * 24:
