@@ -78,6 +78,28 @@ Notes:
 - Full day takes ~60-100 min on a single thread (CSV is ~2.3 GB compressed).
 - See `research/scripts/tardis_fetch.py --help` for all flags.
 
+### DVOL fetcher
+
+`research/scripts/dvol_fetch.py` pulls Deribit's published volatility index (DVOL)
+as OHLC candles. DVOL is the ground-truth target for the offline VIX-style backtest
+(#5) — we run our calculation on the historical option chains and check our number
+against the DVOL value at the same timestamp.
+
+```bash
+# 24 months of hourly DVOL for BTC and ETH
+python research/scripts/dvol_fetch.py --currencies BTC,ETH \
+    --start-date 2024-05-20 --end-date 2026-05-20 \
+    --resolution-sec 3600
+```
+
+Output: `research/data/dvol/{btc,eth}.parquet`. One row per candle, columns
+`timestamp, open, high, low, close`. ~17,500 hourly rows = ~300 KB per currency
+for 24 months. Runs in under 20 seconds total.
+
+Note: Deribit's `resolution` parameter is in seconds (their public docs say
+"minutes" but the API behavior is seconds — verified empirically). Pass `3600`
+for hourly, `60` for 1-minute, `86400` for daily.
+
 ---
 
 ## Conventions
