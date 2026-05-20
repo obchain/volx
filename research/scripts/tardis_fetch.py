@@ -6,7 +6,8 @@ Streams the daily compressed CSV (~2.3 GB), filters BTC/ETH coin-margined option
 resamples to per-minute snapshots (last tick per symbol per minute bucket),
 writes one Parquet file per (currency, date).
 
-Free tier covers first-of-month dates only; other dates require a Tardis API key.
+Free tier covers first-of-month dates only; other dates require a Tardis API key
+(pass --allow-paid-tier to bypass the date check if you have one configured).
 
 Usage:
     python research/scripts/tardis_fetch.py --date 2024-06-01 \\
@@ -33,6 +34,8 @@ URL_TEMPLATE = (
     "{year:04d}/{month:02d}/{day:02d}/OPTIONS.csv.gz"
 )
 
+# bid_iv / ask_iv intentionally omitted — the VIX-style integral uses mark mid-price
+# directly, so only mark_iv is retained for sanity comparison against Deribit's pricer.
 SCHEMA = pa.schema([
     ("timestamp", pa.timestamp("us", tz="UTC")),
     ("symbol", pa.string()),
@@ -58,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--date",
         required=True,
-        help="YYYY-MM-DD (must be first-of-month for free tier)",
+        help="YYYY-MM-DD (must be first-of-month unless --allow-paid-tier is set)",
     )
     p.add_argument(
         "--currencies",
@@ -77,10 +80,19 @@ def parse_args() -> argparse.Namespace:
         help="Output dir (default: research/data/tardis)",
     )
     p.add_argument(
-        "--max-rows",
+        "--debug-max-rows",
         type=int,
         default=None,
-        help="Stop after N raw rows (debug/smoke-test only)",
+        help=(
+            "Stop after N raw rows (smoke-test only). When set, output filename "
+            "becomes snapshot.partial.parquet so downstream globs do not mistake "
+            "a debug run for a full-day fetch."
+        ),
+    )
+    p.add_argument(
+        "--allow-paid-tier",
+        action="store_true",
+        help="Skip the first-of-month date check (requires Tardis API key configured)",
     )
     return p.parse_args()
 
@@ -91,6 +103,15 @@ def safe_float(s: str | None) -> float | None:
     try:
         return float(s)
     except ValueError:
+        return None
+
+
+def safe_int(s: str | None) -> int | None:
+    if s is None or s == "":
+        return None
+    try:
+        return int(s)
+    except (ValueError, TypeError):
         return None
 
 
@@ -105,7 +126,7 @@ def fetch_and_resample(
     currencies: list[str],
     cadence_sec: int,
     out_dir: Path,
-    max_rows: int | None,
+    debug_max_rows: int | None,
 ) -> dict[str, int]:
     url = URL_TEMPLATE.format(year=date.year, month=date.month, day=date.day)
     print(f"GET {url}", file=sys.stderr, flush=True)
@@ -114,13 +135,19 @@ def fetch_and_resample(
     writers: dict[str, pq.ParquetWriter] = {}
     paths: dict[str, Path] = {}
     counts: dict[str, int] = {c: 0 for c in currencies}
+    # active_bucket only advances on rows for that currency. An illiquid currency
+    # with a long tick gap will hold its pending dict open until the next tick
+    # arrives (or the finally block runs at end-of-stream). BTC/ETH on Deribit
+    # tick every second so this is a non-issue for the supported scope; revisit
+    # if --currencies is extended to thinly-traded altcoin options.
     active_bucket: dict[str, int | None] = {c: None for c in currencies}
     pending: dict[str, dict[str, dict[str, str]]] = {c: {} for c in currencies}
 
+    partial_suffix = ".partial" if debug_max_rows is not None else ""
     for currency in currencies:
         outdir = out_dir / currency.lower() / date.isoformat()
         outdir.mkdir(parents=True, exist_ok=True)
-        path = outdir / "snapshot.parquet"
+        path = outdir / f"snapshot{partial_suffix}.parquet"
         paths[currency] = path
         writers[currency] = pq.ParquetWriter(path, SCHEMA, compression="snappy")
 
@@ -136,7 +163,7 @@ def fetch_and_resample(
             cols["currency"].append(currency)
             cols["type"].append(r["type"])
             cols["strike_price"].append(safe_float(r["strike_price"]))
-            cols["expiration"].append(to_utc(int(r["expiration"])) if r["expiration"] else None)
+            cols["expiration"].append(to_utc(safe_int(r["expiration"])))
             cols["bid_price"].append(safe_float(r["bid_price"]))
             cols["bid_amount"].append(safe_float(r["bid_amount"]))
             cols["ask_price"].append(safe_float(r["ask_price"]))
@@ -155,8 +182,15 @@ def fetch_and_resample(
     last_log = t_start
 
     try:
-        with requests.get(url, stream=True, timeout=120) as resp:
+        # timeout=(connect, read): read=None disables the per-socket-read timer so
+        # a transient stall on the long-running stream does not abort the download.
+        with requests.get(url, stream=True, timeout=(30, None)) as resp:
             resp.raise_for_status()
+            # Belt-and-suspenders: make sure urllib3 does not transparently decompress.
+            # Tardis serves the gzip at the file level, so we decompress ourselves
+            # via GzipFile. Setting decode_content=False on resp.raw guards against
+            # accidental gzip-over-gzip if the server ever adds Content-Encoding: gzip.
+            resp.raw.decode_content = False
             gz = gzip.GzipFile(fileobj=resp.raw)
             text = io.TextIOWrapper(gz, encoding="utf-8", newline="")
             reader = csv.DictReader(text)
@@ -174,13 +208,23 @@ def fetch_and_resample(
                 prev = active_bucket[currency]
                 if prev is None:
                     active_bucket[currency] = bucket_start
-                elif bucket_start != prev:
+                elif bucket_start > prev:
+                    # forward advance: emit the closed bucket, open the new one
                     flush(currency, prev)
                     active_bucket[currency] = bucket_start
+                elif bucket_start < prev:
+                    # late arrival (Tardis is sorted by local_timestamp, not
+                    # exchange timestamp). Absorb into the still-open bucket
+                    # rather than re-opening a flushed one — the per-symbol dict
+                    # below will overwrite or insert accordingly.
+                    pass
                 pending[currency][sym] = row
 
-                if max_rows is not None and raw_rows >= max_rows:
-                    print(f"hit --max-rows={max_rows}, stopping early", file=sys.stderr)
+                if debug_max_rows is not None and raw_rows >= debug_max_rows:
+                    print(
+                        f"hit --debug-max-rows={debug_max_rows}, stopping early",
+                        file=sys.stderr,
+                    )
                     break
 
                 now = time.monotonic()
@@ -188,11 +232,12 @@ def fetch_and_resample(
                     last_log = now
                     elapsed = now - t_start
                     rps = raw_rows / elapsed if elapsed > 0 else 0
+                    kept = " ".join(f"{c}={counts[c]:,}" for c in currencies)
                     print(
                         f"  ... {raw_rows:>12,} raw rows  "
                         f"{elapsed:>6.0f}s  "
                         f"{rps:>10,.0f} rows/s  "
-                        f"kept: " + " ".join(f"{c}={counts[c]:,}" for c in currencies),
+                        f"kept: {kept}",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -218,13 +263,18 @@ def fetch_and_resample(
 def main() -> None:
     args = parse_args()
     date = dt.date.fromisoformat(args.date)
-    if date.day != 1:
+    if date.day != 1 and not args.allow_paid_tier:
         print(
-            f"WARNING: {date} is not first-of-month — free tier likely returns 404",
+            f"ERROR: {date} is not first-of-month. The Tardis free tier covers "
+            f"only first-of-month dates; other dates return 404 without an API "
+            f"key. Pass --allow-paid-tier to override (requires API key).",
             file=sys.stderr,
         )
+        sys.exit(2)
     currencies = [c.strip().upper() for c in args.currencies.split(",") if c.strip()]
-    fetch_and_resample(date, currencies, args.cadence_sec, Path(args.out_dir), args.max_rows)
+    fetch_and_resample(
+        date, currencies, args.cadence_sec, Path(args.out_dir), args.debug_max_rows
+    )
 
 
 if __name__ == "__main__":
