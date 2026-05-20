@@ -62,16 +62,19 @@ Tardis.dev free tier (first-of-month dates) and writes per-currency Parquet unde
 python research/scripts/tardis_fetch.py --date 2024-06-01
 
 # smoke-test pipeline without downloading the full 2.3 GB daily file
-python research/scripts/tardis_fetch.py --date 2024-06-01 --max-rows 200000
+# writes snapshot.partial.parquet so it can't be confused with a real run
+python research/scripts/tardis_fetch.py --date 2024-06-01 --debug-max-rows 200000
 
 # coarser cadence for faster runs
 python research/scripts/tardis_fetch.py --date 2024-06-01 --cadence-sec 300
 ```
 
-Output layout: `research/data/tardis/{btc,eth}/{YYYY-MM-DD}/snapshot.parquet`.
+Output layout: `research/data/tardis/{btc,eth}/{YYYY-MM-DD}/snapshot.parquet`
+(or `snapshot.partial.parquet` when `--debug-max-rows` is used).
 
 Notes:
-- Only first-of-month dates are free; other dates require a Tardis API key.
+- Only first-of-month dates are free; other dates hard-fail unless `--allow-paid-tier`
+  is passed and a Tardis API key is configured.
 - Full day takes ~60-100 min on a single thread (CSV is ~2.3 GB compressed).
 - See `research/scripts/tardis_fetch.py --help` for all flags.
 
