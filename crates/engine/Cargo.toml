@@ -6,6 +6,7 @@ rust-version.workspace = true
 version.workspace      = true
 license.workspace      = true
 repository.workspace   = true
+authors.workspace      = true
 
 [[bin]]
 name = "volx-engine"
@@ -13,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 volx-shared-types = { path = "../shared-types" }
+# Used by the strip / variance / interpolate modules landing in #17–#19.
 volx-normalizer   = { path = "../normalizer" }
 
 [lints]
