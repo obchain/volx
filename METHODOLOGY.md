@@ -1,17 +1,23 @@
 # VolX BVOL — Methodology
 
-**Version:** 0.1 (M0 draft)
+**Version:** 0.1.0 (M0 draft)
 **Status:** Reference specification for the M1 Rust engine. Public-facing
 documentation will derive from this file.
 
 This document specifies how the **BVOL** index is computed from option chain
-data. It is the canonical contract between the math reference
-(`research/vix-spx-replication.ipynb`, `research/bvol-backtest.ipynb`,
-`research/bvol-dvol-gap-diagnostics.ipynb`) and the production Rust engine
-(crates `engine`, `normalizer`).
+data. It is the canonical contract between the production Rust engine
+(crates `engine`, `normalizer`) and the Python reference implementations
+that validated the methodology:
 
-For the underlying CBOE math derivation see [`docs/vix-notes.md`](docs/vix-notes.md);
-this file specifies the **VolX-specific adaptations** to crypto options and
+- `docs/vix-notes.md` — derivation of the underlying CBOE variance-swap
+  formula (the math reference).
+- `research/vix-spx-replication.ipynb` — validated SPX implementation
+  (the synthetic-data sanity check).
+- `research/bvol-backtest.ipynb` — end-to-end run on real Deribit chains.
+- `research/bvol-dvol-gap-diagnostics.ipynb` — fitted-IV refinement adopted
+  here and DVOL-gap diagnosis.
+
+This file specifies the **VolX-specific adaptations** to crypto options and
 the operational details the engine must honour.
 
 ---
@@ -66,21 +72,39 @@ convention the rest of the pipeline uses.
 
 ---
 
-## 3. Quote filters (normalizer)
+## 3. Quote filters
 
-Applied before strip construction; identical to CBOE except for the staleness
-and spread thresholds.
+Two filter layers — keep them in distinct code paths.
+
+### 3.1 Normalizer layer (pre-snapshot, applied per tick in live mode)
+
+Operates on each `(instrument, side)` quote as ticks arrive. A side that
+fails any rule is treated as missing for the next downstream snapshot.
 
 | Filter                  | Rule                                                      |
 | ---                     | ---                                                       |
 | Staleness               | Drop quote if last tick > 5 s old.                        |
 | Crossed / locked        | Drop if `ask_price ≤ bid_price`.                          |
 | Spread                  | Drop if `(ask - bid) / mid > 0.30` (30 % spread).         |
-| Zero bid                | Treated by wing-termination rule, not dropped pre-strip.  |
 | Below intrinsic         | Drop if mid < intrinsic value (numerical tolerance 1e-9). |
 
-The filters operate per option (per `(instrument, side)` pair). A side
-failing any filter is treated as missing for that snapshot.
+These filters do **not** apply in the historical Tardis pipeline — that
+input is already snapshot data with no real-time concerns.
+
+### 3.2 Engine layer (per-snapshot, applied at compute time)
+
+Operates on the (already-normalized) snapshot before the IV surface fit.
+
+| Filter                  | Rule                                                      |
+| ---                     | ---                                                       |
+| Missing IV              | Drop strike if `mark_iv ≤ 0.001` or `mark_iv` not finite. |
+| Missing side            | Drop strike if either the call or the put leg is missing for that `(strike, expiry)`. |
+| Strip min size          | Reject the expiry if fewer than 5 strikes survive the two filters above. |
+
+The CBOE-baseline "zero-bid wing-termination" rule is **not part of the
+canonical engine pipeline**; it belonged to the listed-strike CBOE variant
+which we no longer use (replaced by fitted-IV smoothing in §4.3). The rule
+remains documented in `docs/vix-notes.md` for completeness only.
 
 ---
 
@@ -104,13 +128,15 @@ that snapshot — the engine emits a "no expiry pair" status instead.
 
 ### 4.2 Forward price (per expiry)
 
-Put-call parity, restricted to strikes with both sides quoted above 1 satoshi
-worth of USD:
+Put-call parity, restricted to strikes with both sides quoted above `1e-9` USD:
 
 ```
-K* = argmin_K |C_usd(K) − P_usd(K)|   subject to both sides quoted
+K* = argmin_K |C_usd(K) − P_usd(K)|   subject to both sides quoted > 1e-9 USD
 F  = K* + e^{rT} · (C_usd(K*) − P_usd(K*))
 ```
+
+If no strike has both sides quoted above the threshold, the expiry is
+rejected.
 
 (Tie-break: smallest strike index, per `np.argmin`.)
 
@@ -120,19 +146,26 @@ The CBOE white paper uses listed-strike option prices directly. On BTC's
 coarse strike grid (\$1 000–5 000 spacing) the Riemann discretisation error
 is material. The VolX-specific adaptation is **fitted-IV smoothing**:
 
-1. Collect `mark_iv` at every listed strike (fall back to call-side IV if
-   the put side is missing and vice versa; Deribit publishes a single IV per
-   `(strike, expiry)` so the two are equal where both quoted).
-2. Filter out strikes with missing or non-finite IVs.
+1. Collect `mark_iv` at every listed strike. Use the call-side IV as
+   primary; if the call side is missing for that strike, fall back to the
+   put-side IV. (Deribit publishes a single IV per `(strike, expiry)` so
+   the two are equal where both sides quote.)
+2. Filter out strikes with missing or non-finite IVs (§3.2).
 3. Fit a **natural cubic spline** in log-moneyness `x = ln(K / F)` with no
    extrapolation outside the listed strike range.
 4. Sample a dense strike grid of **801 points** linearly between
    `K_min` and `K_max` of the listed strikes.
-5. Evaluate the spline on the dense grid → `iv_dense(K)`. Reject the snapshot
-   if any sampled IV is NaN (spline domain error).
+5. Evaluate the spline on the dense grid → `iv_dense(K)`. Reject the
+   snapshot if any sampled IV is NaN (spline domain error).
+6. **Clamp the result:** `iv_dense ← clip(iv_dense, 1e-4, 5.0)`. This caps
+   near-zero IVs (which would produce divergent BS prices) and unphysical
+   500 %+ IVs (which would dominate the integral). The clamp is part of the
+   canonical methodology — a Rust port that skips it will produce different
+   values for snapshots whose spline produces tiny or huge IVs.
 
-The grid size, the natural-spline boundary condition, and the
-no-extrapolation choice are non-negotiable; changing them changes the index.
+The grid size, the natural-spline boundary condition, the
+no-extrapolation choice, and the clamp bounds are non-negotiable;
+changing any of them changes the index.
 
 ### 4.4 Risk-free rate
 
@@ -184,6 +217,8 @@ variance. Use minutes throughout to avoid fractional-year rounding:
 ```
 N₃₀  = 30 · 1440
 N₃₆₅ = 365 · 1440
+T₁   = N_T₁ / N₃₆₅            # time to near expiry, years
+T₂   = N_T₂ / N₃₆₅            # time to next expiry, years
 w₁ = (N_T₂ − N₃₀) / (N_T₂ − N_T₁)
 w₂ = (N₃₀  − N_T₁) / (N_T₂ − N_T₁)
 σ²_30d = (T₁ · σ²₁ · w₁ + T₂ · σ²₂ · w₂) · (N₃₆₅ / N₃₀)
@@ -231,20 +266,25 @@ expected margin.
 | Risk-free rate             | 0                                       | 0                                     |
 
 On the M0 backtest dataset (3 first-of-month days × 2 currencies × 24 hours
-= 144 hourly snapshots, `research/bvol-dvol-gap-diagnostics.ipynb`):
+= 144 hourly snapshots, `research/bvol-dvol-gap-diagnostics.ipynb`,
+canonical fitted-IV variant):
 
-- **Time-series correlation**: 0.955 (BTC), 0.981 (ETH).
 - **Median absolute relative error**: 5.83 %.
 - **p95 absolute relative error**: 8.66 %.
 - **Bias**: BVOL is **+5.77 % higher** than DVOL on average.
+- **Time-series correlation** (from the baseline-listed-strike PR #36 run;
+  not re-computed for the fitted-IV variant but expected to be at least as
+  good given the lower residual error): 0.955 (BTC), 0.981 (ETH).
 
 The bias is **not a math error**. Per `research/bvol-dvol-gap-diagnostics.ipynb`
 §5, the residual is structural: Deribit BTC + ETH options pay
 `(K − S_T) / S_T` in BTC (the **inverse** spec), not `(K − S_T)` in USD.
 Their published `mark_iv` is calibrated under the BTC-numeraire. Feeding
 USD-converted quotes into the vanilla-CBOE integral inherits a small
-multiplicative offset (per-option ratio 1.03–1.07 vs vanilla Black-Scholes)
-that gets amplified through the integral.
+multiplicative offset (per-option ratio 1.03–1.07 across ATM and near-OTM
+strikes, with occasional deep-OTM outliers above 1.15 driven by Deribit's
+sub-0.001 BTC tick-size granularity) that gets amplified through the
+integral.
 
 Future work (issue #39) will derive a DVOL-aligned variant by re-deriving
 Carr-Madan replication for inverse contracts. That work is **not** required
@@ -254,12 +294,12 @@ to ship BVOL.
 
 ## 7. Reference implementations
 
-| Artifact                                         | Status                                  |
-| ---                                              | ---                                     |
-| `research/vix-spx-replication.ipynb`             | CBOE math validated on synthetic SPX (M0 #3, merged) |
-| `research/bvol-backtest.ipynb`                   | End-to-end run on real Deribit chains (M0 #5, merged) |
-| `research/bvol-dvol-gap-diagnostics.ipynb`       | DVOL-gap diagnosis + fitted-IV adoption (M0 #37, merged) |
-| `crates/engine`                                  | M1 Rust port (#17–#20, in progress)     |
+| Artifact                                         | Status                                            |
+| ---                                              | ---                                               |
+| `research/vix-spx-replication.ipynb`             | CBOE math validated on synthetic SPX (issue #3, PR #30 merged) |
+| `research/bvol-backtest.ipynb`                   | End-to-end run on real Deribit chains (issue #5, PR #36 merged) |
+| `research/bvol-dvol-gap-diagnostics.ipynb`       | DVOL-gap diagnosis + fitted-IV adoption (issue #37, PR #38 merged) |
+| `crates/engine`                                  | M1 Rust port (issues #17–#20, in progress)        |
 
 The Rust engine **must** numerically match the fitted-IV variant of
 `research/bvol-dvol-gap-diagnostics.ipynb` on the same input dataset to
@@ -290,14 +330,14 @@ acceptance criterion for engine correctness (#21).
 
 ## 9. Versioning
 
-This methodology is `v0.1`. Any change that affects published values bumps
-the version:
+This methodology is `0.1.0`. Versions follow semver. Any change that
+affects published values bumps the version:
 
-| Change kind                                          | Version         |
-| ---                                                  | ---             |
-| Bug fix that does not change any published value     | patch (`0.1.1`) |
-| Parameter change (grid size, near-rule, `r`, filters) | minor (`0.2.0`) |
-| Algorithm change (different integral, different smoothing) | major (`1.0.0`) |
+| Change kind                                                  | Next version from `0.1.0` |
+| ---                                                          | ---                       |
+| Bug fix that does not change any published value             | `0.1.1`                   |
+| Parameter change (grid size, near-rule, `r`, filters)        | `0.2.0`                   |
+| Algorithm change (different integral, different smoothing)   | `1.0.0`                   |
 
 Historical values are **never rewritten** on a methodology bump. The change
 log lives in §10; old engine binaries retain backward semantics via the
@@ -309,7 +349,7 @@ version field on the published row.
 
 | Version | Date       | Change                                                |
 | ---     | ---        | ---                                                   |
-| `0.1`   | 2026-05-21 | Initial draft (M0 #6). Fitted-IV smoothing canonical. |
+| `0.1.0` | 2026-05-21 | Initial draft (M0 #6). Fitted-IV smoothing canonical. |
 
 ---
 
