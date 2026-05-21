@@ -1,0 +1,19 @@
+[package]
+name         = "volx-engine"
+description  = "BVOL index engine - strip builder, variance integral, 30-day interpolation, scheduler."
+edition.workspace      = true
+rust-version.workspace = true
+version.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "volx-engine"
+path = "src/main.rs"
+
+[dependencies]
+volx-shared-types = { path = "../shared-types" }
+volx-normalizer   = { path = "../normalizer" }
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name         = "volx-ingestion"
+description  = "Venue connectors that feed option ticks into the normalizer."
+edition.workspace      = true
+rust-version.workspace = true
+version.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "volx-ingestion"
+path = "src/main.rs"
+
+[dependencies]
+volx-shared-types = { path = "../shared-types" }
+
+[lints]
+workspace = true

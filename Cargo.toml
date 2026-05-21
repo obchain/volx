@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/shared-types",
+    "crates/ingestion",
+    "crates/normalizer",
+    "crates/engine",
+]
+
+[workspace.package]
+edition      = "2024"
+rust-version = "1.85"
+version      = "0.1.0"
+license      = "MIT"
+repository   = "https://github.com/obchain/volx"
+
+# Centralized lint policy. Individual crates inherit via:
+#   [lints]
+#   workspace = true
+[workspace.lints.rust]
+unsafe_code           = "forbid"
+unreachable_pub       = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Allow the noisier pedantic lints that fight against clear domain code.
+module_name_repetitions = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+
+# Release profile knobs (worth setting now so the M1 #20 scheduler benchmarks
+# don't accidentally measure debug-mode performance). `lto = "thin"` keeps
+# build time reasonable; switch to `"fat"` only if the engine profile says so.
+[profile.release]
+opt-level = 3
+lto       = "thin"
+codegen-units = 1
+debug     = "line-tables-only"

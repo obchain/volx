@@ -1,0 +1,17 @@
+[package]
+name         = "volx-normalizer"
+description  = "Quote filters + tick deduplication between ingestion and engine."
+edition.workspace      = true
+rust-version.workspace = true
+version.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+volx-shared-types = { path = "../shared-types" }
+
+[lints]
+workspace = true
