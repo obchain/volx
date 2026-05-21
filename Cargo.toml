@@ -12,6 +12,7 @@ edition      = "2024"
 rust-version = "1.85"
 version      = "0.1.0"
 license      = "MIT"
+authors      = ["obchain <riteshnikhoriya94@gmail.com>"]
 repository   = "https://github.com/obchain/volx"
 
 # Centralized lint policy. Individual crates inherit via:
@@ -25,13 +26,19 @@ missing_debug_implementations = "warn"
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # Allow the noisier pedantic lints that fight against clear domain code.
+# `missing_panics_doc` deliberately stays at the pedantic default (warn) — a
+# stray panic in a financial engine should be documented or removed, not
+# silenced workspace-wide.
 module_name_repetitions = "allow"
 missing_errors_doc      = "allow"
-missing_panics_doc      = "allow"
 
 # Release profile knobs (worth setting now so the M1 #20 scheduler benchmarks
 # don't accidentally measure debug-mode performance). `lto = "thin"` keeps
 # build time reasonable; switch to `"fat"` only if the engine profile says so.
+# `codegen-units = 1` overlaps with thin-LTO's cross-CGU inlining; the win is
+# small but it gives reproducible single-thread codegen for benchmarking. If
+# build time becomes a friction point before #20, drop to `codegen-units = 16`
+# without losing much of the inlining benefit.
 [profile.release]
 opt-level = 3
 lto       = "thin"
