@@ -8,6 +8,9 @@ license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "volx-engine"
 path = "src/main.rs"
@@ -16,6 +19,17 @@ path = "src/main.rs"
 volx-shared-types = { path = "../shared-types" }
 # Used by the strip / variance / interpolate modules landing in #17–#19.
 volx-normalizer   = { path = "../normalizer" }
+
+# Math kernel for Black-Scholes pricing (#17). `libm::erf` is the only
+# function we need that std::f64 doesn't have; the rest (sqrt, ln, exp)
+# come from the std intrinsics.
+libm      = { workspace = true }
+# Per-expiry chain snapshots carry `OffsetDateTime` from shared-types;
+# the engine reads it to compute `time_to_expiry` in years.
+time      = { workspace = true }
+tracing   = { workspace = true }
+# Strip-builder + variance-integral error enums.
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
