@@ -1,0 +1,81 @@
+# Local dev compose for VolX (issue #14).
+#
+# Brings up the two persistent backends the M1 pipeline depends on:
+# - ClickHouse 24.x — option ticks + index ticks (schema lands in #15)
+# - Redis 7         — hot latest-value reads + WS pubsub fanout
+#
+# Production (Oracle Cloud Always Free) compose is `docker-compose.prod.yml`
+# and is deferred to M3 — see PRD §13. This file is for `localhost`-only
+# development; both services bind to 127.0.0.1 so a misconfigured firewall
+# cannot accidentally expose them to the LAN.
+
+name: volx-local
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    container_name: volx-clickhouse
+    restart: unless-stopped
+    ports:
+      # HTTP + native ports, localhost-only. Inter-process MySQL + gRPC
+      # ports are not exposed — they are unused for the M1 pipeline.
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    environment:
+      CLICKHOUSE_DB: volx
+      CLICKHOUSE_USER: default
+      # No password in local dev. The ClickHouse port is bound to
+      # 127.0.0.1 and the data lives on a developer laptop. Production
+      # uses a separate compose with a Keychain-sourced password.
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ulimits:
+      # ClickHouse refuses to start with a low nofile cap on macOS Docker
+      # Desktop. The values match the project's recommended minimums.
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+    healthcheck:
+      # `clickhouse-client --query "SELECT 1"` is the canonical liveness
+      # probe; ships with the image, no extra deps.
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: volx-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    command:
+      - "redis-server"
+      # AOF on, no password. Same localhost-only justification as above.
+      - "--appendonly"
+      - "yes"
+      # Cap memory + evict LRU. The latest-value cache + index pubsub
+      # are bounded; 256 MB is comfortably above the working set.
+      - "--maxmemory"
+      - "256mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  # Named volumes so `docker compose down` (without `-v`) preserves data
+  # across restarts. Wipe with `docker compose down -v` when needed.
+  clickhouse-data:
+  clickhouse-logs:
+  redis-data:
