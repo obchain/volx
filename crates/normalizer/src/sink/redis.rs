@@ -61,14 +61,17 @@ impl Default for RedisSinkConfig {
     }
 }
 
-/// Handle owning the producer side of the redis worker. Cloning is cheap
-/// (an `mpsc::Sender` clone) and intentionally cheap — every venue task
-/// fans into the same shared publisher.
-#[derive(Debug, Clone)]
+/// Handle owning the producer side of the redis worker.
+///
+/// The handle is **not** `Clone`: the worker only drains when the last
+/// `Sender` is dropped, and we need [`Self::shutdown`] to be able to
+/// guarantee that drop. Producers share via `Arc<RedisPublisher>` +
+/// `send(&self, …)` instead.
+#[derive(Debug)]
 pub struct RedisPublisher {
     tx: mpsc::Sender<OptionTick>,
     config: RedisSinkConfig,
-    join: std::sync::Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    join: Option<JoinHandle<()>>,
 }
 
 impl RedisPublisher {
@@ -86,8 +89,7 @@ impl RedisPublisher {
         let conn = client.get_multiplexed_async_connection().await?;
 
         let (tx, rx) = mpsc::channel::<OptionTick>(config.queue_capacity);
-        let worker_cfg = config.clone();
-        let join = tokio::spawn(async move { run_worker(client, conn, worker_cfg, rx).await });
+        let join = tokio::spawn(async move { run_worker(client, conn, rx).await });
 
         info!(
             url = %config.url,
@@ -98,7 +100,7 @@ impl RedisPublisher {
         Ok(Self {
             tx,
             config,
-            join: std::sync::Arc::new(std::sync::Mutex::new(Some(join))),
+            join: Some(join),
         })
     }
 
@@ -108,44 +110,38 @@ impl RedisPublisher {
         &self.config
     }
 
-    /// Non-blocking hand-off. On queue overflow, evict + emit
-    /// `volx_normalizer_redis_dropped_total{reason="queue_full"}`.
+    /// Non-blocking hand-off. On queue overflow the **incoming** tick is
+    /// dropped + `volx_normalizer_redis_dropped_total{reason="queue_full"}`
+    /// increments. See the matching note on
+    /// [`super::clickhouse::ClickHouseBatcher::send`] for the
+    /// drop-newest-vs-drop-oldest rationale.
     pub fn send(&self, tick: OptionTick) {
-        let mut pending = tick;
-        loop {
-            match self.tx.try_send(pending) {
-                Ok(()) => return,
-                Err(mpsc::error::TrySendError::Full(returned)) => {
-                    metrics::counter!(
-                        "volx_normalizer_redis_dropped_total",
-                        "reason" => "queue_full"
-                    )
-                    .increment(1);
-                    if self.tx.is_closed() {
-                        warn!("redis worker is gone; dropping tick");
-                        return;
-                    }
-                    pending = returned;
-                    std::thread::yield_now();
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    warn!("redis worker is gone; dropping tick");
-                    return;
-                }
+        match self.tx.try_send(tick) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                metrics::counter!(
+                    "volx_normalizer_redis_dropped_total",
+                    "reason" => "queue_full"
+                )
+                .increment(1);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::counter!(
+                    "volx_normalizer_redis_dropped_total",
+                    "reason" => "worker_gone"
+                )
+                .increment(1);
+                warn!("redis worker is gone; dropping tick");
             }
         }
     }
 
-    /// Wait for the worker to drain + exit. See the matching note on
-    /// `ClickHouseBatcher::shutdown` — actual EOF happens once every
-    /// `Sender` clone is dropped.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the join-handle mutex is poisoned (a previous holder
-    /// panicked mid-shutdown — a programmer error worth surfacing).
-    pub async fn shutdown(&self) {
-        let join = self.join.lock().expect("redis join mutex").take();
+    /// Drop the producer side and wait for the worker to drain + exit.
+    /// Consumes the handle so the inner `Sender` is destroyed before we
+    /// await; see [`super::clickhouse::ClickHouseBatcher::shutdown`].
+    pub async fn shutdown(self) {
+        let Self { tx, join, .. } = self;
+        drop(tx);
         if let Some(join) = join {
             if let Err(e) = join.await {
                 error!(error = ?e, "redis worker join error");
@@ -157,7 +153,6 @@ impl RedisPublisher {
 async fn run_worker(
     client: Client,
     mut conn: MultiplexedConnection,
-    _config: RedisSinkConfig,
     mut rx: mpsc::Receiver<OptionTick>,
 ) {
     while let Some(tick) = rx.recv().await {
@@ -216,8 +211,26 @@ async fn publish(
     Ok(())
 }
 
+/// Re-establish a multiplexed connection, retrying until it succeeds.
+///
+/// The first attempt fires immediately (the publish failure that triggered
+/// us is already the equivalent of a failed handshake); subsequent attempts
+/// space themselves by [`RECONNECT_DELAY`].
+///
+/// **Backlog behavior:** while the worker is in this loop the producer
+/// queue keeps filling at the venue tick rate (~700 ticks/s). On reconnect
+/// the worker drains that backlog in tight succession, presenting Redis
+/// with a small burst (≈ producer rate × outage length). Subscribers that
+/// fan out further should be ready to absorb this; the
+/// `volx_normalizer_redis_dropped_total{reason="queue_full"}` counter is
+/// the alert signal if the outage outlasts queue capacity.
 async fn reconnect(client: &Client) -> MultiplexedConnection {
+    let mut first = true;
     loop {
+        if !first {
+            tokio::time::sleep(RECONNECT_DELAY).await;
+        }
+        first = false;
         match client.get_multiplexed_async_connection().await {
             Ok(c) => {
                 info!("redis reconnected");
@@ -225,7 +238,6 @@ async fn reconnect(client: &Client) -> MultiplexedConnection {
             }
             Err(e) => {
                 error!(error = %e, "redis reconnect failed, retrying");
-                tokio::time::sleep(RECONNECT_DELAY).await;
             }
         }
     }
@@ -251,6 +263,11 @@ fn tick_to_json(t: &OptionTick) -> Result<String, serde_json::Error> {
         .format(&::time::format_description::well_known::Rfc3339)
         .map_err(serde_json::Error::custom)?;
 
+    // `ts` mirrors `received_at` today (matches the ClickHouse row's
+    // `DEFAULT received_at` for `ts`). Pinning both fields in the wire
+    // envelope now means a future change that diverges event-time from
+    // ingest-time won't be a breaking topic-payload change for the
+    // `/v1/stream` (#24) consumers.
     let payload = json!({
         "venue":          venue_label(t.venue),
         "asset":          asset_label(t.asset),
@@ -264,7 +281,8 @@ fn tick_to_json(t: &OptionTick) -> Result<String, serde_json::Error> {
         "underlying":     t.underlying,
         "open_interest":  t.open_interest,
         "volume_24h":     t.volume_24h,
-        "received_at":    received_at,
+        "received_at":    received_at.clone(),
+        "ts":             received_at,
     });
     serde_json::to_string(&payload)
 }
