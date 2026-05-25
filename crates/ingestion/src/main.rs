@@ -57,26 +57,25 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
-        finished = drain_venues(&mut venues) => match finished {
-            Ok(()) => info!("all venue connectors finished"),
-            Err(e) => error!(error = ?e, "venue connector panicked"),
-        },
+        () = drain_venues(&mut venues) => info!("all venue connectors finished"),
         _ = printer => info!("printer task finished"),
     }
     Ok(())
 }
 
 /// Wait for every venue task and log per-venue outcomes. Per-venue isolation:
-/// a panic in one task is logged here and the others continue running.
-async fn drain_venues(venues: &mut JoinSet<&'static str>) -> Result<()> {
+/// a panic in one task is logged at `error!` here and the others keep running
+/// until they finish on their own terms.
+async fn drain_venues(venues: &mut JoinSet<&'static str>) {
     while let Some(joined) = venues.join_next().await {
         match joined {
             Ok(name) => info!(venue = name, "venue connector exited cleanly"),
-            Err(e) if e.is_panic() => warn!(error = ?e, "venue connector panicked"),
-            Err(e) => warn!(error = ?e, "venue connector join error"),
+            Err(e) if e.is_panic() => {
+                error!(error = ?e, "venue connector panicked");
+            }
+            Err(e) => warn!(error = ?e, "venue connector join error (cancelled)"),
         }
     }
-    Ok(())
 }
 
 async fn log_throughput(rx: flume::Receiver<OptionTick>) {
