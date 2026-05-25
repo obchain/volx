@@ -26,7 +26,9 @@
 pub mod bs;
 pub mod spline;
 pub mod strip;
+pub mod variance;
 
 pub use strip::{
     BuildError, ChainLeg, DENSE_GRID_POINTS, ExpiryChain, build_strip, build_strip_with_rate,
 };
+pub use variance::{VarianceError, variance_t, variance_t_with_rate};
