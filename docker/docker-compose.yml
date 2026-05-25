@@ -42,6 +42,10 @@ services:
       # on a long-running dev laptop and the only way to reclaim them
       # would be `docker compose down -v`, which also nukes the data.
       - clickhouse-data:/var/lib/clickhouse
+      # Schema (#15). The official image runs every `*.sql` in this
+      # directory once on the first cold init of the data volume.
+      # Re-apply after edits with `docker compose down -v && up -d`.
+      - ./clickhouse-init.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
       # `clickhouse-client --query "SELECT 1"` is the canonical liveness
       # probe; ships with the image, no extra deps.
