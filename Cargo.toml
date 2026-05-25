@@ -50,6 +50,15 @@ rand               = { version = "0.9" }
 metrics            = { version = "0.24" }
 # TOML config for the normalizer (#12) and later venue / engine modules.
 toml               = { version = "0.8", default-features = false, features = ["parse"] }
+# ClickHouse client for the persistence sink (#16). `inserter` exposes the
+# batched-insert helper we use; `time` makes the driver speak our shared
+# `time::OffsetDateTime` directly; `rustls-tls-ring` keeps the TLS posture
+# consistent with `reqwest` / `tokio-tungstenite` above so prod deploys don't
+# pull in OpenSSL.
+clickhouse         = { version = "0.15", default-features = false, features = ["lz4", "inserter", "time", "rustls-tls-ring", "rustls-tls-webpki-roots"] }
+# Redis pubsub fanout for live consumers (#16). `tokio-comp` is the only
+# async backend we need; TLS lands when a managed Redis is wired in M3.
+redis              = { version = "0.25", default-features = false, features = ["tokio-comp", "keep-alive"] }
 
 # Centralized lint policy. Individual crates inherit via:
 #   [lints]

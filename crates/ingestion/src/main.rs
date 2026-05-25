@@ -4,11 +4,19 @@
 //! [`tokio::task::JoinSet`] so per-venue isolation holds: if Deribit dies or
 //! panics, OKX / Bybit (when added in M2+) keep running. Each connector runs
 //! under `run_with_retry` (issue #10) and reconnects with exponential backoff
-//! on its own; this `main` only wires the topology and the throughput sink.
+//! on its own.
+//!
+//! Downstream of the connectors:
+//! - issues #12 + #13 filter and dedup the tick stream (`volx-normalizer`)
+//! - issue #16 forks each survivor to two sinks:
+//!   `ClickHouse` (durable, batched) and Redis pubsub (live fanout).
+//!
+//! Environment variables (see `.env.example`):
+//! - `CLICKHOUSE_URL`  (default `http://127.0.0.1:8123`)
+//! - `CLICKHOUSE_DB`   (default `volx`)
+//! - `REDIS_URL`       (default `redis://127.0.0.1:6379`)
 
 mod venues;
-
-use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::task::JoinSet;
@@ -25,8 +33,9 @@ const TICK_CHANNEL_CAPACITY: usize = 50_000;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,volx_ingestion=info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new("info,volx_ingestion=info,volx_normalizer=info")
+            }),
         )
         .with_target(false)
         .init();
@@ -35,6 +44,13 @@ async fn main() -> Result<()> {
         version = volx_shared_types::METHODOLOGY_VERSION,
         "volx-ingestion starting"
     );
+
+    // Persistence endpoints. Defaults match `.env.example` so a local
+    // `docker compose up -d` works out of the box without env wiring.
+    let clickhouse_url =
+        std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
+    let clickhouse_db = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "volx".into());
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
 
     let (tx, rx) = flume::bounded::<OptionTick>(TICK_CHANNEL_CAPACITY);
 
@@ -49,16 +65,25 @@ async fn main() -> Result<()> {
         });
     }
     // Drop the original `tx`: each venue task holds its own clone. Without
-    // this, the printer would never see `channel closed` because `main`
+    // this, the pipeline would never see `channel closed` because `main`
     // would keep one Sender alive forever.
     drop(tx);
 
-    let printer = tokio::spawn(log_throughput(rx));
+    // Pipeline owns the receiver: filter → dedup → fork(ClickHouse, Redis).
+    // Spawned so `main` can race it against ctrl-c + the venue drain.
+    let pipeline = tokio::spawn(async move {
+        if let Err(e) =
+            volx_normalizer::run_default_pipeline(rx, &clickhouse_url, &clickhouse_db, &redis_url)
+                .await
+        {
+            error!(error = %e, "pipeline failed to start");
+        }
+    });
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
         () = drain_venues(&mut venues) => info!("all venue connectors finished"),
-        _ = printer => info!("printer task finished"),
+        _ = pipeline => info!("pipeline task finished"),
     }
     Ok(())
 }
@@ -76,35 +101,4 @@ async fn drain_venues(venues: &mut JoinSet<&'static str>) {
             Err(e) => warn!(error = ?e, "venue connector join error (cancelled)"),
         }
     }
-}
-
-async fn log_throughput(rx: flume::Receiver<OptionTick>) {
-    let report_every = Duration::from_secs(5);
-    let mut total: u64 = 0;
-    let mut window_count: u64 = 0;
-    let mut last_report = Instant::now();
-
-    while let Ok(tick) = rx.recv_async().await {
-        total += 1;
-        window_count += 1;
-        if last_report.elapsed() >= report_every {
-            let window_secs = last_report.elapsed().as_secs_f64();
-            #[allow(clippy::cast_precision_loss)]
-            let window_rate = window_count as f64 / window_secs;
-            info!(
-                total = total,
-                window_rate_per_s = format!("{window_rate:.1}"),
-                window_count = window_count,
-                last_asset = ?tick.asset,
-                last_strike = tick.strike,
-                last_kind = ?tick.kind,
-                last_iv = ?tick.iv,
-                last_mid = ?tick.mid,
-                "throughput"
-            );
-            last_report = Instant::now();
-            window_count = 0;
-        }
-    }
-    info!(total = total, "channel closed");
 }
