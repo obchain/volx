@@ -14,6 +14,19 @@
 //! increments. The methodology §5 contract of "publish a null row with
 //! status" requires a schema bump on `index_ticks` (it has no status
 //! column today); that lands in a future PR.
+//!
+//! ## Dedup
+//!
+//! `index_ticks` is plain `MergeTree`, not `ReplacingMergeTree`, so a
+//! re-INSERT of the same `(index_id, ts)` row accumulates and the
+//! `index_1m` materialized view would double-count. Within a single
+//! engine process, `tokio::time::interval(60s)` guarantees the
+//! per-tick `now` values are at least 60 seconds apart, so the
+//! 60-second `index_1m` bucket gets exactly one observation per
+//! index. Across engine restarts within the same 60-second bar a
+//! duplicate is still possible — a persistent dedup guard (Redis
+//! `SET … NX EX 60` keyed on `(index_id, bar)`) belongs to a
+//! follow-up hardening PR; not in scope for #20.
 
 use std::time::Duration;
 
