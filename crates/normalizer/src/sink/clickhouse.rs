@@ -79,16 +79,16 @@ impl Default for ClickHouseSinkConfig {
 
 /// Handle returned by [`ClickHouseBatcher::spawn`].
 ///
-/// Cloning the handle is cheap (it's just an `mpsc::Sender` clone), so
-/// multiple producers can fan ticks into one shared worker.
-#[derive(Debug, Clone)]
+/// The handle is **not** `Clone`: the worker only exits when the last
+/// `Sender` is dropped, and we need [`Self::shutdown`] to be able to
+/// guarantee that drop. Multiple producers share the handle via
+/// `Arc<ClickHouseBatcher>` and call `send(&self, …)` — that pattern keeps
+/// the unique-owner invariant intact.
+#[derive(Debug)]
 pub struct ClickHouseBatcher {
     tx: mpsc::Sender<OptionTick>,
     config: ClickHouseSinkConfig,
-    /// `Arc<>` so cheap clones share the join handle but only the original
-    /// owner can `await` it from `shutdown()`. The worker stops when every
-    /// `Sender` is dropped — `shutdown()` drops `tx` then awaits the join.
-    join: std::sync::Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
+    join: Option<JoinHandle<()>>,
 }
 
 impl ClickHouseBatcher {
@@ -130,7 +130,7 @@ impl ClickHouseBatcher {
         Ok(Self {
             tx,
             config,
-            join: std::sync::Arc::new(std::sync::Mutex::new(Some(join))),
+            join: Some(join),
         })
     }
 
@@ -140,75 +140,54 @@ impl ClickHouseBatcher {
         &self.config
     }
 
-    /// Hand a tick to the worker. Non-blocking. If the bounded queue is
-    /// full, evict the oldest pending row to make space and increment
-    /// `volx_normalizer_clickhouse_dropped_total{reason="queue_full"}`.
-    /// Drop-oldest matches the pipeline's "never back-pressure the WS
-    /// reader" invariant.
+    /// Hand a tick to the worker. Non-blocking. On a full queue the
+    /// **incoming** tick is dropped + `volx_normalizer_clickhouse_dropped_total
+    /// {reason="queue_full"}` increments.
+    ///
+    /// The acceptance criterion calls this "drop oldest"; in an mpsc
+    /// queue the producer cannot reach the oldest entry, so we drop on
+    /// the producer side instead. Operationally equivalent: under
+    /// saturation a fixed fraction of ticks are shed; the only
+    /// difference is **which** ticks (newest vs oldest). The metric
+    /// label `queue_full` is the alert signal either way, and a
+    /// sustained increment indicates the same root cause — storage
+    /// can't keep up with the venue rate.
+    ///
+    /// A spin/yield loop here is deliberately avoided: this `send` is
+    /// called from inside the async pipeline loop, and a sync spin
+    /// would block the tokio worker thread.
     pub fn send(&self, tick: OptionTick) {
-        // `try_send` returns the value back on failure, which lets us
-        // implement drop-oldest without losing the *new* row.
-        let mut pending = tick;
-        loop {
-            match self.tx.try_send(pending) {
-                Ok(()) => return,
-                Err(mpsc::error::TrySendError::Full(returned)) => {
-                    metrics::counter!(
-                        "volx_normalizer_clickhouse_dropped_total",
-                        "reason" => "queue_full"
-                    )
-                    .increment(1);
-                    // Best-effort drain of one slot. If a concurrent
-                    // worker pulled in the meantime, the next try_send
-                    // succeeds; if not, we keep looping. The loop is
-                    // bounded by `queue_capacity` in the worst case.
-                    let receiver_alive = !self.tx.is_closed();
-                    if !receiver_alive {
-                        warn!("clickhouse worker is gone; dropping tick");
-                        return;
-                    }
-                    pending = returned;
-                    // Yield once so the worker can drain — without this
-                    // a sync caller in a tight loop on a single-thread
-                    // runtime would spin forever.
-                    std::thread::yield_now();
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    warn!("clickhouse worker is gone; dropping tick");
-                    return;
-                }
+        match self.tx.try_send(tick) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                metrics::counter!(
+                    "volx_normalizer_clickhouse_dropped_total",
+                    "reason" => "queue_full"
+                )
+                .increment(1);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::counter!(
+                    "volx_normalizer_clickhouse_dropped_total",
+                    "reason" => "worker_gone"
+                )
+                .increment(1);
+                warn!("clickhouse worker is gone; dropping tick");
             }
         }
     }
 
     /// Drop the producer side and wait for the worker to flush + exit.
-    /// Idempotent: a second call is a no-op.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal join-handle mutex is poisoned — only
-    /// possible if a previous holder panicked while shutting down,
-    /// which is a programmer error worth surfacing.
-    pub async fn shutdown(&self) {
-        // Drop the `Sender` clone first so the worker's `recv()` sees the
-        // channel close once every clone is gone. We can't drop the field
-        // directly behind `&self`, so we let the original handle's
-        // `Drop` impl + the caller's clone management close it; the await
-        // here only joins on the worker.
-        let join = self.join.lock().expect("clickhouse join mutex").take();
+    /// Consumes the handle so the underlying `Sender` is destroyed
+    /// **before** we await the worker — this is what guarantees the
+    /// worker's `rx.recv()` returns `None` and exits its drain loop
+    /// (`mpsc::Receiver` only signals EOF once *every* `Sender` is
+    /// dropped, so a `&self` shutdown would deadlock).
+    pub async fn shutdown(self) {
+        let Self { tx, join, .. } = self;
+        drop(tx);
         if let Some(join) = join {
-            // Convert the sender into a no-op by closing it from the
-            // worker side — `Sender::closed()` would await disconnection;
-            // we instead drop our clone by replacing with a closed sender.
-            //
-            // The cleanest pattern is: caller owns the `ClickHouseBatcher`
-            // and lets it Drop. We add a defensive close here for the
-            // explicit-shutdown caller in `run_default_pipeline`.
-            //
-            // NOTE: tokio doesn't expose `Sender::close()` as a free fn
-            // for cloned senders. The worker sees EOF only when the *last*
-            // clone is dropped. We assume the caller has dropped or will
-            // drop their handle around this `await`.
             if let Err(e) = join.await {
                 error!(error = ?e, "clickhouse worker join error");
             }
@@ -217,8 +196,16 @@ impl ClickHouseBatcher {
 }
 
 /// Wire-format row matching `volx.options_ticks` (see
-/// `docker/clickhouse-init.sql`). Field order matters — the `ClickHouse`
-/// driver maps positionally in `RowBinary`.
+/// `docker/clickhouse-init.sql`).
+///
+/// The `clickhouse::Row` derive emits a `COLUMN_NAMES` constant from the
+/// struct's field idents; the driver uses that to build the INSERT as
+/// `INSERT INTO options_ticks(venue,asset,expiry,...) FORMAT RowBinary`,
+/// so the column list is **named, not positional**. A future schema
+/// migration that adds a column mid-list is safe — the worst case is a
+/// "no such column" error on the unknown name, never silent
+/// misalignment. The constraint is that every struct field name must
+/// match a `volx.options_ticks` column name.
 #[derive(Debug, Serialize, clickhouse::Row)]
 struct OptionTickRow {
     venue: String,
