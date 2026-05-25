@@ -8,7 +8,9 @@ cloud accounts, no API keys.
 - **Docker** with `docker compose` v2 (Desktop on macOS / Windows; the
   `docker.io` distro on Linux).
 - **Rust 1.85+** (`rustup default stable`).
-- ~2 GB free RAM and ~1 GB disk for the ClickHouse data volume.
+- ~2 GB free RAM and **several GB** disk for the ClickHouse data
+  volume (grows with ingested tick history; budget more if running
+  the pipeline overnight).
 
 ## 1. Start the backends
 
@@ -32,10 +34,10 @@ curl -s 'http://127.0.0.1:8123/?query=SELECT%201'
 # -> 1
 
 # ClickHouse: native client (in-container)
-docker exec -it volx-clickhouse clickhouse-client --query "SELECT version()"
+docker exec -i volx-clickhouse clickhouse-client --query "SELECT version()"
 
 # Redis
-docker exec -it volx-redis redis-cli ping
+docker exec -i volx-redis redis-cli ping
 # -> PONG
 ```
 
