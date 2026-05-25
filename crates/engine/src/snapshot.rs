@@ -51,6 +51,8 @@ pub enum SnapshotError {
     NoNearExpiry(volx_shared_types::Asset),
     #[error("no next expiry > 30d for asset {0:?}")]
     NoNextExpiry(volx_shared_types::Asset),
+    #[error("neither near nor next expiry available for asset {0:?}")]
+    NoBracket(volx_shared_types::Asset),
     #[error("strip build failed (near): {0}")]
     NearStrip(BuildError),
     #[error("strip build failed (next): {0}")]
@@ -74,6 +76,7 @@ impl SnapshotError {
             Self::MissingAsset(_) => "missing_asset",
             Self::NoNearExpiry(_) => "no_near_expiry",
             Self::NoNextExpiry(_) => "no_next_expiry",
+            Self::NoBracket(_) => "no_bracket",
             Self::NearStrip(_) => "near_strip",
             Self::NextStrip(_) => "next_strip",
             Self::NearVariance(_) => "near_variance",
@@ -135,6 +138,15 @@ pub fn run_snapshot(
 
 /// §4.1 expiry picker. Returns `(near, next)` references into the
 /// caller-owned map, or `None` if the constraints aren't satisfied.
+///
+/// Boundary note: an expiry exactly at `T_BRACKET` (`30d / 365`) falls
+/// through both arms — `[7d, 30d)` excludes the upper bound and the
+/// `t > T_BRACKET` arm requires strict greater-than. Both per §4.1
+/// ("near in `[7d, 30d)`, next `> 30d`"), so an instrument with TTE
+/// exactly 30d matches neither and is silently skipped. In practice
+/// Deribit publishes 8:00-UTC-Friday expiries so the probability of
+/// hitting this boundary is effectively zero, but the spec is
+/// deliberate and we honour it.
 fn pick_expiries(
     per_asset: &HashMap<OffsetDateTime, ExpiryChain>,
 ) -> Option<(&ExpiryChain, &ExpiryChain)> {
@@ -160,9 +172,13 @@ fn pick_expiries(
     }
 }
 
-/// Decide which variant of `NoNear / NoNext` to raise when `pick_expiries`
-/// fails. Lets the caller produce a precise reason label without doing
-/// the per-side scan twice.
+/// Decide which variant of `NoNear / NoNext / NoBracket` to raise
+/// when `pick_expiries` fails. Lets the caller produce a precise
+/// reason label without doing the per-side scan twice. Distinguishing
+/// "no near + no next" from "one missing" matters for Grafana
+/// dashboards keyed on `reason` — between roll dates both legs can
+/// disappear simultaneously and aggregating that case with a single
+/// `no_near_expiry` would hide a different operational state.
 fn pick_failure(
     per_asset: &HashMap<OffsetDateTime, ExpiryChain>,
     asset: volx_shared_types::Asset,
@@ -170,10 +186,16 @@ fn pick_failure(
     let has_near = per_asset
         .values()
         .any(|c| (T_NEAR_MIN..T_BRACKET).contains(&c.time_to_expiry.0));
-    if has_near {
-        SnapshotError::NoNextExpiry(asset)
-    } else {
-        SnapshotError::NoNearExpiry(asset)
+    let has_next = per_asset.values().any(|c| c.time_to_expiry.0 > T_BRACKET);
+    match (has_near, has_next) {
+        (true, false) => SnapshotError::NoNextExpiry(asset),
+        (false, true) => SnapshotError::NoNearExpiry(asset),
+        // `(false, false)` is the legitimate no-bracket case (e.g.
+        // between roll dates); `(true, true)` is logically unreachable
+        // because then `pick_expiries` would have succeeded — fold
+        // both into `NoBracket` so the metric carries the bug-signal
+        // for the unreachable branch.
+        _ => SnapshotError::NoBracket(asset),
     }
 }
 
@@ -391,5 +413,30 @@ mod tests {
             SnapshotError::NoNextExpiry(Asset::Btc).as_label(),
             "no_next_expiry"
         );
+        assert_eq!(
+            SnapshotError::NoBracket(Asset::Btc).as_label(),
+            "no_bracket"
+        );
+    }
+
+    /// Regression for review MED-3: when *both* near and next are
+    /// missing, the picker failure must surface as `NoBracket` so the
+    /// Grafana counter aggregates this case separately from
+    /// "only-one-missing".
+    #[test]
+    fn rejects_with_no_bracket_when_both_legs_missing() {
+        let mut chains: AssetChains = HashMap::new();
+        let per_asset = chains.entry(Asset::Btc).or_default();
+        // A 3-day expiry — below T_NEAR_MIN (7d) — matches neither
+        // arm of the §4.1 picker.
+        per_asset.insert(
+            time::macros::datetime!(2026-05-28 08:00:00 UTC),
+            flat_iv_chain(100.0, 4.0, 30, 3.0 / 365.0, 0.5),
+        );
+        let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
+        match run_snapshot(&chains, IndexId::Bvol, now) {
+            Err(SnapshotError::NoBracket(_)) => {}
+            other => panic!("expected NoBracket, got {other:?}"),
+        }
     }
 }

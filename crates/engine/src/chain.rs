@@ -83,18 +83,31 @@ pub type AssetChains = HashMap<Asset, HashMap<OffsetDateTime, ExpiryChain>>;
 ///
 /// # Panics
 ///
-/// Does not panic; the `unwrap_or(0)` clamp on the cutoff conversion
-/// degrades to a no-op `WHERE ts >= 0` rather than aborting.
+/// Does not panic; the `unwrap_or(i64::MAX)` fallback on the cutoff
+/// conversion produces an *empty* result rather than a full-table
+/// scan if the timestamp ever overflows `i64` (year ≈ 292,000,000 —
+/// not reachable in any sane clock, but the right fallback is "skip
+/// the tick" not "rescan a year of history").
 pub async fn fetch_chains(client: &Client, now: OffsetDateTime) -> Result<AssetChains, ChainError> {
     let cutoff_ms = i64::try_from(
         now.unix_timestamp_nanos() / 1_000_000 - i128::from(SNAPSHOT_FRESHNESS_SECS) * 1000,
     )
-    .unwrap_or(0);
+    .unwrap_or(i64::MAX);
 
     // `argMax(field, ts)` picks the field value at the row with the
     // largest `ts` in the group — i.e. the *latest* observation per
     // instrument. The `ts >= cutoff` filter drops stale rows so a
     // dead feed doesn't masquerade as a live snapshot.
+    //
+    // `WHERE venue = 'deribit'` is a deliberate single-venue scoping.
+    // The schema is already multi-venue (`venue` sits in the
+    // `options_ticks` ORDER BY), but folding two venues' mid-quotes
+    // into one `argMax(mid, ts)` would silently mix legs whose
+    // bid/ask come from different order books — the strip builder
+    // would get a chain whose call and put legs disagree on the
+    // forward. TODO(#25): replace the literal with a per-venue
+    // GROUP BY + cross-venue best-quote merge when the OKX / Bybit
+    // connectors land.
     let query = "
         SELECT
             asset,
@@ -108,6 +121,7 @@ pub async fn fetch_chains(client: &Client, now: OffsetDateTime) -> Result<AssetC
             argMax(underlying, ts) AS underlying
         FROM volx.options_ticks
         WHERE ts >= fromUnixTimestamp64Milli(?)
+          AND venue = 'deribit'
         GROUP BY asset, expiry, strike, kind
     ";
 
