@@ -28,6 +28,21 @@ time       = { version = "0.3", default-features = false, features = ["std", "se
 # no transitive deps.
 hex        = { version = "0.4", default-features = false, features = ["std"] }
 
+# Async runtime + I/O — ingestion crate (#9 onwards). Bringing tokio in once at
+# workspace level keeps the engine + normalizer on the same major version
+# when they later need timers / channels.
+tokio              = { version = "1.43" }
+tokio-tungstenite  = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util       = { version = "0.3", default-features = false, features = ["std"] }
+flume              = { version = "0.11", default-features = false, features = ["async"] }
+# rustls over native-tls: avoids OpenSSL / system-crypto fragility on
+# Oracle Cloud Always Free deploy targets.
+reqwest            = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tracing            = { version = "0.1" }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+anyhow             = { version = "1" }
+thiserror          = { version = "2" }
+
 # Centralized lint policy. Individual crates inherit via:
 #   [lints]
 #   workspace = true
