@@ -24,10 +24,12 @@
 //! `volx-shared-types`; the engine just adds the per-stage builders.
 
 pub mod bs;
+pub mod interpolate;
 pub mod spline;
 pub mod strip;
 pub mod variance;
 
+pub use interpolate::{ExpiryVariance, InterpError, bvol, interpolate_30d};
 pub use strip::{
     BuildError, ChainLeg, DENSE_GRID_POINTS, ExpiryChain, build_strip, build_strip_with_rate,
 };
