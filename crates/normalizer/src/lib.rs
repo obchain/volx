@@ -24,8 +24,10 @@
 //! - **Persist to `ClickHouse` + Redis pubsub** → issue #16.
 
 pub mod config;
+pub mod dedup;
 
 pub use config::NormalizerConfig;
+pub use dedup::{DedupKey, DedupOutcome, Deduper};
 
 use time::OffsetDateTime;
 use tracing::trace;

@@ -23,6 +23,16 @@ const DEFAULT_MAX_SPREAD_RATIO: f64 = 0.30;
 /// indistinguishable from venue rounding.
 const DEFAULT_INTRINSIC_TOLERANCE: f64 = 1e-2;
 
+/// Default dedup sliding-window (seconds). Issue #13 — "LRU cache of last
+/// 60 s". A repeated `(venue, instrument, received_at)` inside this window
+/// is treated as a duplicate.
+pub(crate) const DEFAULT_DEDUP_WINDOW_SECS: f64 = 60.0;
+
+/// Default hard cap on the dedup cache size. Sizing: at the measured peak
+/// 1 000 ticks/s × 60 s = 60 000 entries. Cap at 4 × that so a transient
+/// burst can't blow memory, but normal flow never trips it.
+pub(crate) const DEFAULT_DEDUP_MAX_ENTRIES: usize = 240_000;
+
 const fn default_max_age_secs() -> f64 {
     DEFAULT_MAX_AGE_SECS
 }
@@ -31,6 +41,12 @@ const fn default_max_spread_ratio() -> f64 {
 }
 const fn default_intrinsic_tolerance() -> f64 {
     DEFAULT_INTRINSIC_TOLERANCE
+}
+const fn default_dedup_window_secs() -> f64 {
+    DEFAULT_DEDUP_WINDOW_SECS
+}
+const fn default_dedup_max_entries() -> usize {
+    DEFAULT_DEDUP_MAX_ENTRIES
 }
 
 /// Thresholds for the per-tick filter pipeline.
@@ -57,6 +73,14 @@ pub struct NormalizerConfig {
     /// margin so a mid exactly at intrinsic is not flagged.
     #[serde(default = "default_intrinsic_tolerance")]
     pub intrinsic_tolerance: f64,
+    /// Sliding-window length for `(venue, instrument, ts)` dedup, in
+    /// seconds. Issue #13. A repeated tick inside this window is dropped.
+    #[serde(default = "default_dedup_window_secs")]
+    pub dedup_window_secs: f64,
+    /// Hard cap on dedup cache size. Acts as a memory safety net under
+    /// burst load; the time-window eviction is what normally bounds it.
+    #[serde(default = "default_dedup_max_entries")]
+    pub dedup_max_entries: usize,
 }
 
 impl Default for NormalizerConfig {
@@ -65,6 +89,8 @@ impl Default for NormalizerConfig {
             max_age_secs: default_max_age_secs(),
             max_spread_ratio: default_max_spread_ratio(),
             intrinsic_tolerance: default_intrinsic_tolerance(),
+            dedup_window_secs: default_dedup_window_secs(),
+            dedup_max_entries: default_dedup_max_entries(),
         }
     }
 }
@@ -81,6 +107,12 @@ impl NormalizerConfig {
     pub fn max_age(&self) -> Duration {
         Duration::from_secs_f64(self.max_age_secs)
     }
+
+    /// `dedup_window_secs` as a [`Duration`].
+    #[must_use]
+    pub fn dedup_window(&self) -> Duration {
+        Duration::from_secs_f64(self.dedup_window_secs)
+    }
 }
 
 #[cfg(test)]
@@ -96,6 +128,14 @@ mod tests {
         // per-venue coin→USD conversion rounding without false drops on
         // deep ITM options. See config.rs `DEFAULT_INTRINSIC_TOLERANCE`.
         assert!((c.intrinsic_tolerance - 1e-2).abs() < 1e-12);
+        assert!((c.dedup_window_secs - 60.0).abs() < 1e-12);
+        assert_eq!(c.dedup_max_entries, 240_000);
+    }
+
+    #[test]
+    fn dedup_window_duration_conversion() {
+        let c = NormalizerConfig::default();
+        assert_eq!(c.dedup_window(), Duration::from_secs(60));
     }
 
     #[test]
