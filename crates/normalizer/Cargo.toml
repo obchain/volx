@@ -14,14 +14,25 @@ path = "src/lib.rs"
 [dependencies]
 volx-shared-types = { path = "../shared-types" }
 
-serde   = { workspace = true }
-time    = { workspace = true }
-toml    = { workspace = true }
-metrics = { workspace = true }
-tracing = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+time       = { workspace = true }
+toml       = { workspace = true }
+metrics    = { workspace = true }
+tracing    = { workspace = true }
+
+# Persistence stack (issue #16). The sink module ties the per-tick filter
+# pipeline to the storage layer that lands ticks in ClickHouse + fans them
+# out via Redis pubsub for live consumers.
+tokio      = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+flume      = { workspace = true }
+anyhow     = { workspace = true }
+clickhouse = { workspace = true }
+redis      = { workspace = true }
 
 [dev-dependencies]
-time = { workspace = true }
+time  = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 
 [lints]
 workspace = true

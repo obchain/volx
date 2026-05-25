@@ -25,9 +25,14 @@
 
 pub mod config;
 pub mod dedup;
+pub mod sink;
 
 pub use config::NormalizerConfig;
 pub use dedup::{DedupKey, DedupOutcome, Deduper};
+pub use sink::{
+    ClickHouseBatcher, ClickHouseSinkConfig, RedisPublisher, RedisSinkConfig, run_default_pipeline,
+    run_pipeline,
+};
 
 use time::OffsetDateTime;
 use tracing::trace;
