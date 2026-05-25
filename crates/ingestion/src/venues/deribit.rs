@@ -208,6 +208,12 @@ const JITTER_RATIO: f64 = 0.20;
 /// successful flow is enough to qualify as healthy.
 const HEALTHY_TICK_THRESHOLD: u64 = 500;
 
+/// Courtesy delay between a healthy server-side close and the next connect.
+/// The failure-path backoff schedule does not apply (we observed ticks, the
+/// server just cycled), so this is just enough to avoid an immediate
+/// reconnect storm during a venue maintenance window.
+const HEALTHY_RECONNECT_DELAY: Duration = Duration::from_millis(100);
+
 /// Per-venue reconnect state.
 #[derive(Debug, Default)]
 pub(crate) struct ReconnectState {
@@ -262,13 +268,16 @@ impl ReconnectState {
 /// Run the Deribit connector with reconnect + exponential backoff (issue #10).
 ///
 /// Returns only when the downstream `flume` receiver is dropped — every other
-/// session exit triggers a backoff + reconnect cycle. Per-venue isolation is
-/// the caller's job: spawn this in its own `tokio` task per venue and a panic
-/// in one will not stop the others (see `crates/ingestion/src/main.rs`).
+/// session exit triggers a reconnect cycle (backoff on the failure path,
+/// [`HEALTHY_RECONNECT_DELAY`] on a healthy server-side cycle). Per-venue
+/// isolation is the caller's job: spawn this in its own `tokio` task per
+/// venue and a panic in one will not stop the others (see
+/// `crates/ingestion/src/main.rs`).
 pub(crate) async fn run_with_retry(assets: Vec<Asset>, tx: flume::Sender<OptionTick>) {
     let mut state = ReconnectState::default();
     loop {
-        match connect_and_stream(&assets, tx.clone()).await {
+        let outcome = connect_and_stream(&assets, tx.clone()).await;
+        match outcome {
             Ok(SessionExit::DownstreamClosed) => {
                 info!("downstream channel closed — Deribit connector stopping");
                 return;
@@ -278,26 +287,31 @@ pub(crate) async fn run_with_retry(assets: Vec<Asset>, tx: flume::Sender<OptionT
             {
                 warn!(
                     ticks_received,
+                    delay_ms =
+                        u64::try_from(HEALTHY_RECONNECT_DELAY.as_millis()).unwrap_or(u64::MAX),
                     "Deribit server closed a healthy session; reconnecting"
                 );
                 state.note_healthy();
+                // Skip the failure-path backoff: this session was good.
+                tokio::time::sleep(HEALTHY_RECONNECT_DELAY).await;
+                continue;
             }
             Ok(SessionExit::ServerClosed { ticks_received }) => {
+                state.note_failure();
                 warn!(
                     ticks_received,
-                    consecutive_after = state.consecutive + 1,
+                    consecutive = state.consecutive,
                     "Deribit server closed an unhealthy session; reconnecting"
                 );
-                state.note_failure();
                 emit_threshold_alerts(&mut state);
             }
             Err(e) => {
+                state.note_failure();
                 warn!(
                     error = ?e,
-                    consecutive_after = state.consecutive + 1,
+                    consecutive = state.consecutive,
                     "Deribit session failed; reconnecting"
                 );
-                state.note_failure();
                 emit_threshold_alerts(&mut state);
             }
         }
