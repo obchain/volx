@@ -1,16 +1,18 @@
 //! Ingestion binary.
 //!
-//! Spawns the per-venue connectors (only Deribit lands in #9) and drains the
-//! resulting `OptionTick` stream, logging throughput every 5 s. Downstream
-//! consumers (normalizer, `ClickHouse` writer, in-process subscribers) will
-//! replace the throughput-logger receiver in later milestones.
+//! Spawns each venue connector as its own `tokio` task tracked by a
+//! [`tokio::task::JoinSet`] so per-venue isolation holds: if Deribit dies or
+//! panics, OKX / Bybit (when added in M2+) keep running. Each connector runs
+//! under `run_with_retry` (issue #10) and reconnects with exponential backoff
+//! on its own; this `main` only wires the topology and the throughput sink.
 
 mod venues;
 
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tracing::{error, info};
+use tokio::task::JoinSet;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use volx_shared_types::{Asset, OptionTick};
 
@@ -36,18 +38,43 @@ async fn main() -> Result<()> {
 
     let (tx, rx) = flume::bounded::<OptionTick>(TICK_CHANNEL_CAPACITY);
 
-    let connector = tokio::spawn(async move {
-        if let Err(e) = venues::deribit::connect_and_stream(&[Asset::Btc, Asset::Eth], tx).await {
-            error!(error = ?e, "deribit connector exited with error");
-        }
-    });
+    // One task per venue. Each owns its own reconnect / backoff loop so a
+    // panic or persistent failure on one venue cannot stall the others.
+    let mut venues: JoinSet<&'static str> = JoinSet::new();
+    {
+        let tx = tx.clone();
+        venues.spawn(async move {
+            venues::deribit::run_with_retry(vec![Asset::Btc, Asset::Eth], tx).await;
+            "deribit"
+        });
+    }
+    // Drop the original `tx`: each venue task holds its own clone. Without
+    // this, the printer would never see `channel closed` because `main`
+    // would keep one Sender alive forever.
+    drop(tx);
 
     let printer = tokio::spawn(log_throughput(rx));
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => info!("ctrl-c received, shutting down"),
-        _ = connector => info!("connector task finished"),
+        finished = drain_venues(&mut venues) => match finished {
+            Ok(()) => info!("all venue connectors finished"),
+            Err(e) => error!(error = ?e, "venue connector panicked"),
+        },
         _ = printer => info!("printer task finished"),
+    }
+    Ok(())
+}
+
+/// Wait for every venue task and log per-venue outcomes. Per-venue isolation:
+/// a panic in one task is logged here and the others continue running.
+async fn drain_venues(venues: &mut JoinSet<&'static str>) -> Result<()> {
+    while let Some(joined) = venues.join_next().await {
+        match joined {
+            Ok(name) => info!(venue = name, "venue connector exited cleanly"),
+            Err(e) if e.is_panic() => warn!(error = ?e, "venue connector panicked"),
+            Err(e) => warn!(error = ?e, "venue connector join error"),
+        }
     }
     Ok(())
 }

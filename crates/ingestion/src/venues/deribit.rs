@@ -1,4 +1,4 @@
-//! Deribit WebSocket connector — issue #9.
+//! Deribit WebSocket connector — issues #9 + #10.
 //!
 //! Fetches the active option instrument set from Deribit's REST API, opens a
 //! single WebSocket connection, subscribes to the
@@ -7,22 +7,28 @@
 //! `flume` channel per market update. See [`TICKER_INTERVAL`] for the
 //! `.100ms` vs `.raw` choice (the latter requires authentication).
 //!
+//! [`run_with_retry`] wraps [`connect_and_stream`] with exponential backoff
+//! and the alerting hooks called out in PRD §3.3 / issue #10.
+//!
 //! Out of scope (deferred to follow-up issues):
-//! - reconnect + exponential backoff → issue #10
-//! - tracing fields + Prometheus tick counters → issue #11
-//! - application-level Deribit `set_heartbeat` keepalive → issue #10
-//!   (without it the connection lives until the TCP layer drops it; fine for
-//!   the #9 acceptance smoke run but not for a 24/7 deployment)
-//! - per-side filters (stale / spread / intrinsic) → normalizer crate, #12
+//! - tracing spans + Prometheus tick counters → issue #11 (the threshold log
+//!   sites here use stable `threshold = ...` fields so #11 can attach a
+//!   `metrics` / Sentry / ntfy backend without touching call sites).
+//! - application-level Deribit `set_heartbeat` keepalive (without it the WS
+//!   lives until the TCP layer drops it; reconnect now handles that for free
+//!   but a heartbeat would catch silent stalls sooner) → tracked in #10's
+//!   follow-up notes; not blocking the M1 critical path.
+//! - per-side filters (stale / spread / intrinsic) → normalizer crate, #12.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
 use serde::Deserialize;
 use time::{Date, Month, OffsetDateTime, Time};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use volx_shared_types::{Asset, OptionKind, OptionTick, Venue};
 
@@ -40,13 +46,34 @@ const SUBSCRIBE_BATCH: usize = 100;
 /// in #10, not a connector change.
 const TICKER_INTERVAL: &str = "100ms";
 
+/// Outcome of one WebSocket session.
+///
+/// `connect_and_stream` returns this so the reconnect wrapper can tell a
+/// healthy server-side close (cycle the connection, keep going) from a
+/// downstream consumer drop (stop reconnecting). Errors (`Result::Err`) take
+/// a third path and trigger the backoff schedule.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SessionExit {
+    /// Downstream `flume` receiver was dropped. Caller should stop reconnecting.
+    DownstreamClosed,
+    /// Server closed the WS or the read stream ended without error.
+    /// `ticks_received` lets the caller decide whether the session was
+    /// healthy enough to reset the backoff counter.
+    ServerClosed { ticks_received: u64 },
+}
+
 /// Connect, subscribe to every active BTC + ETH option ticker, and push one
-/// `OptionTick` per market update into `tx`. Returns when the WebSocket
-/// stream ends or the channel receiver is dropped.
+/// `OptionTick` per market update into `tx`. Returns a [`SessionExit`] tag on
+/// any clean termination; `Err` only on connection / subscribe / parse errors
+/// that should trigger a reconnect.
+// The body is long but already factored into three obvious phases (REST →
+// subscribe → read). Splitting further would only pass arguments through one
+// extra layer.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn connect_and_stream(
     assets: &[Asset],
     tx: flume::Sender<OptionTick>,
-) -> Result<()> {
+) -> Result<SessionExit> {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .user_agent(concat!("volx-ingestion/", env!("CARGO_PKG_VERSION")))
@@ -95,6 +122,8 @@ pub(crate) async fn connect_and_stream(
         Ok::<_, anyhow::Error>(())
     });
 
+    let mut ticks_received: u64 = 0;
+    let mut downstream_dropped = false;
     while let Some(frame) = read.next().await {
         let msg = frame.context("WS frame")?;
         let payload = match msg {
@@ -143,8 +172,10 @@ pub(crate) async fn connect_and_stream(
         };
         if tx.send_async(tick).await.is_err() {
             info!("downstream channel closed; ingestion exiting");
+            downstream_dropped = true;
             break;
         }
+        ticks_received += 1;
     }
     // Read half ended (Close frame, error, or downstream-closed). Make sure
     // the subscribe task isn't left running and surface any send error.
@@ -153,7 +184,153 @@ pub(crate) async fn connect_and_stream(
         Ok(Ok(())) | Err(_) => {} // joined cleanly or was aborted mid-flight
         Ok(Err(e)) => return Err(e.context("subscribe task")),
     }
-    Ok(())
+    Ok(if downstream_dropped {
+        SessionExit::DownstreamClosed
+    } else {
+        SessionExit::ServerClosed { ticks_received }
+    })
+}
+
+// ---------- Reconnect + exponential backoff (issue #10) ----------
+
+/// Alert threshold for "too many back-to-back failures" (PRD §3.3).
+const CONSECUTIVE_FAILURES_ALERT: u32 = 5;
+/// Alert threshold for "downtime sustained beyond …" (PRD §3.3).
+const DOWNTIME_ALERT: Duration = Duration::from_secs(10 * 60);
+/// Cap on the backoff delay so we never wait longer than this between attempts.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// `±JITTER_RATIO` fraction applied to the base delay each attempt.
+const JITTER_RATIO: f64 = 0.20;
+/// Healthy-session threshold: a server-side close that produced fewer ticks
+/// than this counts as a failed attempt for backoff purposes (prevents a
+/// tight reconnect loop if the server keeps closing us right after
+/// subscribe). Tuned to the smoke-test rate (~500 ticks/s), so ~1 s of
+/// successful flow is enough to qualify as healthy.
+const HEALTHY_TICK_THRESHOLD: u64 = 500;
+
+/// Per-venue reconnect state.
+#[derive(Debug, Default)]
+pub(crate) struct ReconnectState {
+    /// Number of consecutive errored or unhealthy sessions since the last
+    /// healthy one.
+    consecutive: u32,
+    /// `Some(start)` once we have entered a sustained-failure streak; cleared
+    /// on a healthy session. `current_downtime()` is the elapsed time since
+    /// that anchor.
+    first_failure_at: Option<Instant>,
+    /// Latched so the `DOWNTIME_ALERT` threshold log only fires once per
+    /// outage rather than every retry cycle past the boundary.
+    notified_downtime: bool,
+}
+
+impl ReconnectState {
+    fn note_failure(&mut self) {
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.first_failure_at.is_none() {
+            self.first_failure_at = Some(Instant::now());
+        }
+    }
+
+    fn note_healthy(&mut self) {
+        self.consecutive = 0;
+        self.first_failure_at = None;
+        self.notified_downtime = false;
+    }
+
+    fn current_downtime(&self) -> Duration {
+        self.first_failure_at
+            .map_or(Duration::ZERO, |t| t.elapsed())
+    }
+
+    /// Backoff schedule: `1 → 2 → 4 → 8 → 16` seconds, capped at
+    /// [`MAX_BACKOFF`], with `±JITTER_RATIO` jitter applied each call.
+    fn next_delay(&self) -> Duration {
+        let base_secs = match self.consecutive {
+            0 | 1 => 1,
+            2 => 2,
+            3 => 4,
+            4 => 8,
+            5 => 16,
+            _ => MAX_BACKOFF.as_secs(),
+        };
+        let base = Duration::from_secs(base_secs).min(MAX_BACKOFF);
+        let jitter: f64 = rand::rng().random_range(-JITTER_RATIO..=JITTER_RATIO);
+        base.mul_f64(1.0 + jitter)
+    }
+}
+
+/// Run the Deribit connector with reconnect + exponential backoff (issue #10).
+///
+/// Returns only when the downstream `flume` receiver is dropped — every other
+/// session exit triggers a backoff + reconnect cycle. Per-venue isolation is
+/// the caller's job: spawn this in its own `tokio` task per venue and a panic
+/// in one will not stop the others (see `crates/ingestion/src/main.rs`).
+pub(crate) async fn run_with_retry(assets: Vec<Asset>, tx: flume::Sender<OptionTick>) {
+    let mut state = ReconnectState::default();
+    loop {
+        match connect_and_stream(&assets, tx.clone()).await {
+            Ok(SessionExit::DownstreamClosed) => {
+                info!("downstream channel closed — Deribit connector stopping");
+                return;
+            }
+            Ok(SessionExit::ServerClosed { ticks_received })
+                if ticks_received >= HEALTHY_TICK_THRESHOLD =>
+            {
+                warn!(
+                    ticks_received,
+                    "Deribit server closed a healthy session; reconnecting"
+                );
+                state.note_healthy();
+            }
+            Ok(SessionExit::ServerClosed { ticks_received }) => {
+                warn!(
+                    ticks_received,
+                    consecutive_after = state.consecutive + 1,
+                    "Deribit server closed an unhealthy session; reconnecting"
+                );
+                state.note_failure();
+                emit_threshold_alerts(&mut state);
+            }
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    consecutive_after = state.consecutive + 1,
+                    "Deribit session failed; reconnecting"
+                );
+                state.note_failure();
+                emit_threshold_alerts(&mut state);
+            }
+        }
+        let delay = state.next_delay();
+        info!(
+            delay_s = delay.as_secs_f64(),
+            consecutive = state.consecutive,
+            downtime_s = state.current_downtime().as_secs(),
+            "reconnect delay"
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
+fn emit_threshold_alerts(state: &mut ReconnectState) {
+    // Cross-boundary edge (`== ALERT`) is logged once per outage; the
+    // structured `threshold` field is what #11 attaches Prometheus +
+    // Sentry breadcrumb backends to.
+    if state.consecutive == CONSECUTIVE_FAILURES_ALERT {
+        error!(
+            threshold = "consecutive_failures",
+            consecutive = state.consecutive,
+            "Deribit reconnect threshold reached (Prometheus counter + Sentry breadcrumb)"
+        );
+    }
+    if state.current_downtime() >= DOWNTIME_ALERT && !state.notified_downtime {
+        state.notified_downtime = true;
+        error!(
+            threshold = "downtime_10min",
+            downtime_s = state.current_downtime().as_secs(),
+            "Deribit downtime exceeded 10 min (ntfy push)"
+        );
+    }
 }
 
 // ---------- REST instrument discovery ----------
@@ -477,5 +654,106 @@ mod tests {
         });
         let data: TickerData = serde_json::from_value(raw).unwrap();
         assert!(ticker_to_tick("not-a-ticker-channel", &data).is_err());
+    }
+
+    // ---------- ReconnectState (issue #10) ----------
+
+    /// Drop jitter for assertions on the base schedule.
+    fn base_secs(s: &ReconnectState) -> u64 {
+        match s.consecutive {
+            0 | 1 => 1,
+            2 => 2,
+            3 => 4,
+            4 => 8,
+            5 => 16,
+            _ => MAX_BACKOFF.as_secs(),
+        }
+    }
+
+    #[test]
+    fn backoff_schedule_follows_1_2_4_8_16_then_caps_at_30() {
+        let mut s = ReconnectState::default();
+        let expected = [1, 2, 4, 8, 16, 30, 30, 30];
+        for want in expected {
+            s.note_failure();
+            assert_eq!(base_secs(&s), want, "consecutive={}", s.consecutive);
+        }
+    }
+
+    #[test]
+    fn next_delay_stays_within_jitter_envelope() {
+        let mut s = ReconnectState::default();
+        for _ in 0..3 {
+            s.note_failure();
+        } // base = 4s
+        for _ in 0..200 {
+            let d = s.next_delay();
+            // ±20 % envelope around 4 s = [3.2 s, 4.8 s].
+            assert!(d >= Duration::from_millis(3_200), "{d:?} below floor");
+            assert!(d <= Duration::from_millis(4_800), "{d:?} above ceiling");
+        }
+    }
+
+    #[test]
+    fn next_delay_never_exceeds_cap_plus_jitter() {
+        let mut s = ReconnectState::default();
+        for _ in 0..50 {
+            s.note_failure();
+        } // far past cap
+        let d = s.next_delay();
+        // base cap = 30 s, +20 % jitter ceiling = 36 s.
+        assert!(d <= Duration::from_secs(36), "{d:?} above hard cap");
+    }
+
+    #[test]
+    fn note_healthy_resets_consecutive_and_downtime() {
+        let mut s = ReconnectState::default();
+        s.note_failure();
+        s.note_failure();
+        s.note_failure();
+        assert_eq!(s.consecutive, 3);
+        assert!(s.first_failure_at.is_some());
+        s.note_healthy();
+        assert_eq!(s.consecutive, 0);
+        assert!(s.first_failure_at.is_none());
+        assert!(!s.notified_downtime);
+    }
+
+    #[test]
+    fn first_failure_at_only_set_on_first_failure_of_a_streak() {
+        let mut s = ReconnectState::default();
+        s.note_failure();
+        let first_anchor = s.first_failure_at.expect("anchor must be set");
+        // Second failure must not shift the anchor — downtime measures the
+        // full outage, not just the most recent attempt.
+        std::thread::sleep(Duration::from_millis(5));
+        s.note_failure();
+        assert_eq!(s.first_failure_at, Some(first_anchor));
+    }
+
+    #[test]
+    fn current_downtime_zero_until_first_failure() {
+        let s = ReconnectState::default();
+        assert_eq!(s.current_downtime(), Duration::ZERO);
+    }
+
+    #[test]
+    fn alert_constants_match_prd() {
+        assert_eq!(CONSECUTIVE_FAILURES_ALERT, 5);
+        assert_eq!(DOWNTIME_ALERT, Duration::from_secs(600));
+        assert_eq!(MAX_BACKOFF, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn session_exit_variants_are_distinguishable() {
+        // Sanity check the consumer-facing discriminator the reconnect loop
+        // dispatches on.
+        let a = SessionExit::DownstreamClosed;
+        let b = SessionExit::ServerClosed { ticks_received: 7 };
+        assert_ne!(a, b);
+        match b {
+            SessionExit::ServerClosed { ticks_received } => assert_eq!(ticks_received, 7),
+            SessionExit::DownstreamClosed => panic!("wrong variant"),
+        }
     }
 }
