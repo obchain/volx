@@ -11,7 +11,7 @@
 use time::macros::datetime;
 use volx_shared_types::{
     Asset, IndexId, IndexValue, Minutes, OptionKind, OptionTick, Strip, StripHash, StripQuote,
-    Venue, Years,
+    Venue, Years, strip::MIN_STRIP_QUOTES,
 };
 
 fn assert_json_roundtrip<T>(value: &T)
@@ -25,7 +25,10 @@ where
 
 #[test]
 fn venue_wire_format_is_snake_case() {
-    assert_eq!(serde_json::to_string(&Venue::Deribit).unwrap(), "\"deribit\"");
+    assert_eq!(
+        serde_json::to_string(&Venue::Deribit).unwrap(),
+        "\"deribit\""
+    );
     assert_eq!(serde_json::to_string(&Venue::Okx).unwrap(), "\"okx\"");
     assert_eq!(serde_json::to_string(&Venue::Bybit).unwrap(), "\"bybit\"");
     for v in [Venue::Deribit, Venue::Okx, Venue::Bybit] {
@@ -43,7 +46,10 @@ fn asset_wire_format_is_snake_case() {
 
 #[test]
 fn option_kind_wire_format_is_snake_case() {
-    assert_eq!(serde_json::to_string(&OptionKind::Call).unwrap(), "\"call\"");
+    assert_eq!(
+        serde_json::to_string(&OptionKind::Call).unwrap(),
+        "\"call\""
+    );
     assert_eq!(serde_json::to_string(&OptionKind::Put).unwrap(), "\"put\"");
 }
 
@@ -59,7 +65,10 @@ fn index_id_wire_format_is_uppercase_ticker() {
 #[test]
 fn time_unit_newtypes_are_transparent() {
     assert_eq!(serde_json::to_string(&Years(0.25)).unwrap(), "0.25");
-    assert_eq!(serde_json::to_string(&Minutes(43_200.0)).unwrap(), "43200.0");
+    assert_eq!(
+        serde_json::to_string(&Minutes(43_200.0)).unwrap(),
+        "43200.0"
+    );
     let y: Years = serde_json::from_str("0.5").unwrap();
     assert_eq!(y, Years(0.5));
 }
@@ -133,9 +142,31 @@ fn strip_round_trips_through_json() {
         k_zero: 68_000.0,
         time_to_expiry: Years(30.0 / 365.0),
         quotes: vec![
-            StripQuote { strike: 60_000.0, q_usd: 12.5, iv: 0.70 },
-            StripQuote { strike: 68_000.0, q_usd: 1_200.0, iv: 0.62 },
-            StripQuote { strike: 80_000.0, q_usd: 8.0, iv: 0.65 },
+            StripQuote {
+                strike: 55_000.0,
+                q_usd: 4.0,
+                iv: 0.72,
+            },
+            StripQuote {
+                strike: 60_000.0,
+                q_usd: 12.5,
+                iv: 0.70,
+            },
+            StripQuote {
+                strike: 68_000.0,
+                q_usd: 1_200.0,
+                iv: 0.62,
+            },
+            StripQuote {
+                strike: 80_000.0,
+                q_usd: 8.0,
+                iv: 0.65,
+            },
+            StripQuote {
+                strike: 90_000.0,
+                q_usd: 3.0,
+                iv: 0.68,
+            },
         ],
     };
     let encoded = serde_json::to_string(&strip).expect("serialize");
@@ -143,8 +174,50 @@ fn strip_round_trips_through_json() {
     assert_eq!(decoded.forward, strip.forward);
     assert_eq!(decoded.k_zero, strip.k_zero);
     assert_eq!(decoded.time_to_expiry, strip.time_to_expiry);
-    assert_eq!(decoded.quotes.len(), 3);
-    assert_eq!(decoded.quotes[1].strike, 68_000.0);
+    assert_eq!(decoded.quotes.len(), 5);
+    assert_eq!(decoded.quotes[2].strike, 68_000.0);
+}
+
+#[test]
+fn strip_rejects_below_minimum_quote_count() {
+    let too_short = format!(
+        r#"{{"forward":68500.0,"k_zero":68000.0,"time_to_expiry":0.0822,
+            "quotes":[{}]}}"#,
+        (0..MIN_STRIP_QUOTES - 1)
+            .map(|i| format!(
+                r#"{{"strike":{},"q_usd":1.0,"iv":0.5}}"#,
+                60_000 + i * 1_000
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let err = serde_json::from_str::<Strip>(&too_short).expect_err("must reject short strip");
+    assert!(err.to_string().contains("must have >="), "{err}");
+}
+
+#[test]
+fn strip_quote_rejects_out_of_range_iv() {
+    let bad = r#"{"strike":68000.0,"q_usd":1.0,"iv":7.5}"#;
+    let err = serde_json::from_str::<StripQuote>(bad).expect_err("must reject high IV");
+    assert!(err.to_string().contains("fitted IV"), "{err}");
+}
+
+#[test]
+fn index_value_rejects_out_of_range_confidence() {
+    let bad = r#"{"index_id":"BVOL","value":65.0,"confidence":1.5,
+                  "strip_hash":"0000000000000000000000000000000000000000000000000000000000000000",
+                  "ts":"2026-05-25T12:00:00Z"}"#;
+    let err = serde_json::from_str::<IndexValue>(bad).expect_err("must reject confidence > 1");
+    assert!(err.to_string().contains("confidence"), "{err}");
+}
+
+#[test]
+fn index_value_rejects_negative_value() {
+    let bad = r#"{"index_id":"BVOL","value":-1.0,"confidence":0.5,
+                  "strip_hash":"0000000000000000000000000000000000000000000000000000000000000000",
+                  "ts":"2026-05-25T12:00:00Z"}"#;
+    let err = serde_json::from_str::<IndexValue>(bad).expect_err("must reject negative value");
+    assert!(err.to_string().contains("value"), "{err}");
 }
 
 #[test]

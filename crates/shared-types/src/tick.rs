@@ -21,6 +21,10 @@ use crate::ids::{Asset, OptionKind, Venue};
 ///   normalization happens in the ingestion decoder, not here.
 /// - `bid`, `ask`, `mid`, `iv` are `Option<f64>` because the normalizer's
 ///   per-side filters (§3.1) may invalidate one side of a quote independently.
+/// - `open_interest` and `volume_24h` are the **number of option contracts**
+///   (NOT USD or coin notional). Venues that publish only notional get
+///   divided through by `contract_size × underlying` in the ingestion
+///   decoder so this field is venue-comparable.
 /// - `expiry` and `received_at` are UTC, millisecond precision (§5).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptionTick {
