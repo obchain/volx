@@ -36,8 +36,12 @@ services:
         soft: 262144
         hard: 262144
     volumes:
+      # Data is named-volume persisted across `down` (without `-v`).
+      # Logs intentionally live in the container layer so they're wiped
+      # on `down` — otherwise the trace + query logs grow without bound
+      # on a long-running dev laptop and the only way to reclaim them
+      # would be `docker compose down -v`, which also nukes the data.
       - clickhouse-data:/var/lib/clickhouse
-      - clickhouse-logs:/var/log/clickhouse-server
     healthcheck:
       # `clickhouse-client --query "SELECT 1"` is the canonical liveness
       # probe; ships with the image, no extra deps.
@@ -56,10 +60,14 @@ services:
     command:
       - "redis-server"
       # AOF on, no password. Same localhost-only justification as above.
+      # AOF + allkeys-lru is intentional cache semantics, not durable
+      # storage: when memory hits the cap, Redis evicts LRU keys, and
+      # the eviction (DEL) is recorded in the AOF — so a replay
+      # reconstructs the *post-eviction* state. The latest-value cache +
+      # pubsub workload is meant to be exactly that (lossy under
+      # pressure), so this is correct rather than a footgun.
       - "--appendonly"
       - "yes"
-      # Cap memory + evict LRU. The latest-value cache + index pubsub
-      # are bounded; 256 MB is comfortably above the working set.
       - "--maxmemory"
       - "256mb"
       - "--maxmemory-policy"
@@ -77,5 +85,4 @@ volumes:
   # Named volumes so `docker compose down` (without `-v`) preserves data
   # across restarts. Wipe with `docker compose down -v` when needed.
   clickhouse-data:
-  clickhouse-logs:
   redis-data:
