@@ -11,5 +11,13 @@ authors.workspace      = true
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+serde = { workspace = true }
+time  = { workspace = true }
+hex   = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true
