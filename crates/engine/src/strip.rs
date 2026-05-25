@@ -104,10 +104,12 @@ pub fn build_strip(chain: &ExpiryChain) -> Result<Strip, BuildError> {
 ///
 /// # Panics
 ///
-/// Sort uses `partial_cmp` and panics if the chain contains a strike
-/// `NaN`; the upstream normalizer's `BelowIntrinsic` / `Crossed` filters
-/// already discard non-finite strikes, so this branch indicates a bug
-/// upstream, not a legitimate data condition.
+/// Sort uses `partial_cmp` and will panic if the chain contains a
+/// strike that is `NaN`. The engine deliberately does not pre-validate
+/// strikes (the normalizer + chain assembler upstream should never
+/// emit a NaN strike; the panic surfaces the bug rather than silently
+/// dropping the leg). Callers that ingest from an untrusted source
+/// should filter `!leg.strike.is_finite()` before calling.
 pub fn build_strip_with_rate(chain: &ExpiryChain, r: f64) -> Result<Strip, BuildError> {
     let t = chain.time_to_expiry.0;
     if !t.is_finite() || t <= 0.0 {
@@ -280,11 +282,19 @@ fn pick_forward(legs: &[ChainLeg], t: f64, r: f64) -> Result<f64, BuildError> {
 }
 
 /// Methodology §4.3 step 1: prefer call-side IV; fall back to put-side
-/// if the call leg is missing. Deribit publishes a single IV per
-/// `(strike, expiry)` so the two are equal in practice — the fallback
-/// matters only when the normalizer dropped the call leg.
+/// if the call leg is missing **or non-finite**. Deribit publishes a
+/// single IV per `(strike, expiry)` so the two are equal in practice,
+/// but the normalizer can also leave the call-side field populated with
+/// `NaN` when the leg failed the filter pipeline mid-quote — treat
+/// that the same as "call missing" and try the put.
+///
+/// (`Option::or` short-circuits on `Some(_)` regardless of contents, so
+/// a naive `call.or(put).filter(finite)` drops the strike entirely when
+/// `call = Some(NaN)`. Filter each side **before** combining.)
 fn pick_iv(leg: &ChainLeg) -> Option<f64> {
-    leg.call_iv.or(leg.put_iv).filter(|v| v.is_finite())
+    leg.call_iv
+        .filter(|v| v.is_finite())
+        .or_else(|| leg.put_iv.filter(|v| v.is_finite()))
 }
 
 #[cfg(test)]
@@ -500,6 +510,34 @@ mod tests {
             build_strip(&chain),
             Err(BuildError::NonPositiveT(_))
         ));
+    }
+
+    #[test]
+    fn pick_iv_falls_back_to_put_when_call_is_nan() {
+        // Regression: `Option::or` short-circuits on `Some(NaN)`, so a
+        // naive `call.or(put).filter(finite)` would silently drop the
+        // strike even though the put-side IV is usable. The fix filters
+        // each side independently.
+        let leg = ChainLeg {
+            strike: 100.0,
+            call_mid_usd: Some(1.0),
+            put_mid_usd: Some(1.0),
+            call_iv: Some(f64::NAN),
+            put_iv: Some(0.42),
+        };
+        assert_eq!(pick_iv(&leg), Some(0.42));
+    }
+
+    #[test]
+    fn pick_iv_skips_both_when_neither_is_finite() {
+        let leg = ChainLeg {
+            strike: 100.0,
+            call_mid_usd: Some(1.0),
+            put_mid_usd: Some(1.0),
+            call_iv: Some(f64::NAN),
+            put_iv: Some(f64::INFINITY),
+        };
+        assert_eq!(pick_iv(&leg), None);
     }
 
     #[test]
