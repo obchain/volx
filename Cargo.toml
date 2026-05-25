@@ -44,6 +44,12 @@ anyhow             = { version = "1" }
 thiserror          = { version = "2" }
 # Used by reconnect-backoff jitter (#10). Tiny dep, std-only.
 rand               = { version = "0.9" }
+# Metrics facade for the normalizer (#12) and the engine. The Prometheus
+# exporter (#11) wires in via `metrics-exporter-prometheus` against this
+# same facade so emit sites do not change.
+metrics            = { version = "0.24" }
+# TOML config for the normalizer (#12) and later venue / engine modules.
+toml               = { version = "0.8", default-features = false, features = ["parse"] }
 
 # Centralized lint policy. Individual crates inherit via:
 #   [lints]
