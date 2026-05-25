@@ -1,9 +1,11 @@
 //! Deribit WebSocket connector — issue #9.
 //!
 //! Fetches the active option instrument set from Deribit's REST API, opens a
-//! single WebSocket connection, subscribes to the `ticker.{instrument}.raw`
-//! channel for every BTC + ETH coin-margined option, and pushes one
-//! normalised [`OptionTick`] into a `flume` channel per market update.
+//! single WebSocket connection, subscribes to the
+//! `ticker.{instrument}.{TICKER_INTERVAL}` channel for every BTC + ETH
+//! coin-margined option, and pushes one normalised [`OptionTick`] into a
+//! `flume` channel per market update. See [`TICKER_INTERVAL`] for the
+//! `.100ms` vs `.raw` choice (the latter requires authentication).
 //!
 //! Out of scope (deferred to follow-up issues):
 //! - reconnect + exponential backoff → issue #10
@@ -66,26 +68,32 @@ pub(crate) async fn connect_and_stream(
         .context("Deribit WS connect")?;
     let (mut write, mut read) = ws_stream.split();
 
-    for (batch_idx, batch) in instruments.chunks(SUBSCRIBE_BATCH).enumerate() {
-        let channels: Vec<String> = batch
-            .iter()
-            .map(|n| format!("ticker.{n}.{TICKER_INTERVAL}"))
-            .collect();
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": batch_idx + 1,
-            "method": "public/subscribe",
-            "params": { "channels": channels },
-        });
-        write
-            .send(Message::text(payload.to_string()))
-            .await
-            .context("send subscribe")?;
-    }
-    info!(
-        batches = instruments.len().div_ceil(SUBSCRIBE_BATCH),
-        "subscriptions sent"
-    );
+    // Send the subscribe burst from a separate task so the read half is
+    // drained concurrently. Without this, TCP backpressure could deadlock
+    // once the subscribe set grows past the socket's recv buffer (the read
+    // task is blocked on the next batch's `write.send` because the server's
+    // ack frames are filling the recv window).
+    let total_batches = instruments.len().div_ceil(SUBSCRIBE_BATCH);
+    let subscribe_handle = tokio::spawn(async move {
+        for (batch_idx, batch) in instruments.chunks(SUBSCRIBE_BATCH).enumerate() {
+            let channels: Vec<String> = batch
+                .iter()
+                .map(|n| format!("ticker.{n}.{TICKER_INTERVAL}"))
+                .collect();
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": batch_idx + 1,
+                "method": "public/subscribe",
+                "params": { "channels": channels },
+            });
+            write
+                .send(Message::text(payload.to_string()))
+                .await
+                .context("send subscribe")?;
+        }
+        info!(batches = total_batches, "subscriptions sent");
+        Ok::<_, anyhow::Error>(())
+    });
 
     while let Some(frame) = read.next().await {
         let msg = frame.context("WS frame")?;
@@ -107,7 +115,7 @@ pub(crate) async fn connect_and_stream(
             }
         };
         if let Some(err) = envelope.error {
-            warn!(id = ?envelope.id, error = %err, "Deribit subscribe error");
+            warn!(id = ?envelope.id, error = ?err, "Deribit subscribe error");
             continue;
         }
         let Some(params) = envelope.params else {
@@ -137,6 +145,13 @@ pub(crate) async fn connect_and_stream(
             info!("downstream channel closed; ingestion exiting");
             break;
         }
+    }
+    // Read half ended (Close frame, error, or downstream-closed). Make sure
+    // the subscribe task isn't left running and surface any send error.
+    subscribe_handle.abort();
+    match subscribe_handle.await {
+        Ok(Ok(())) | Err(_) => {} // joined cleanly or was aborted mid-flight
+        Ok(Err(e)) => return Err(e.context("subscribe task")),
     }
     Ok(())
 }
@@ -243,6 +258,14 @@ fn parse_expiry(s: &str) -> Result<OffsetDateTime> {
     let year_2: i32 = year_str
         .parse()
         .with_context(|| format!("year `{year_str}`"))?;
+    // Guard against a garbled date producing a far-future / far-past expiry
+    // that would silently corrupt the vol surface. Deribit options run within
+    // a calendar year of the current date; the 2025-2099 envelope is loose
+    // enough to outlast the project without admitting nonsense like year
+    // 1999 from a `BTC-30JUN-1-…` mis-split.
+    if !(25..=99).contains(&year_2) {
+        bail!("year `{year_str}` outside plausible range");
+    }
     let year = 2000 + year_2;
     let month = match month_str {
         "JAN" => Month::January,
@@ -314,9 +337,12 @@ fn ticker_to_tick(channel: &str, data: &TickerData) -> Result<OptionTick> {
         _ => None,
     };
     let iv_fraction = data.mark_iv.map(|p| p / 100.0);
+    // Propagate a bad timestamp instead of substituting `now_utc()`: a corrupt
+    // exchange timestamp must drop the tick, not pose as a fresh one to the
+    // normalizer's staleness check (METHODOLOGY §3.1).
     let received_at =
         OffsetDateTime::from_unix_timestamp_nanos(i128::from(data.timestamp) * 1_000_000)
-            .unwrap_or_else(|_| OffsetDateTime::now_utc());
+            .with_context(|| format!("timestamp {} out of range", data.timestamp))?;
 
     Ok(OptionTick {
         venue: Venue::Deribit,
