@@ -28,8 +28,24 @@ libm      = { workspace = true }
 # the engine reads it to compute `time_to_expiry` in years.
 time      = { workspace = true }
 tracing   = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 # Strip-builder + variance-integral error enums.
 thiserror = { workspace = true }
+anyhow    = { workspace = true }
+
+# Scheduler (#20): pulls latest ticks from ClickHouse, publishes index
+# rows back to ClickHouse + Redis (latest-value cache + pubsub stream).
+tokio      = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+clickhouse = { workspace = true }
+redis      = { workspace = true }
+# `strip_hash` audit field — SHA-256 over the input quote bytes so
+# replays of the same snapshot land at the same hash.
+sha2       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+# Counters routed through the `metrics` facade; Prom exporter from #11
+# picks them up unchanged.
+metrics    = { workspace = true }
 
 [lints]
 workspace = true
