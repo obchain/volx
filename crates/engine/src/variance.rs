@@ -2,10 +2,10 @@
 //!
 //! Trapezoidal Carr-Madan on the fitted-IV dense grid produced by
 //! [`crate::strip::build_strip`]. Pure numerics: input is a [`Strip`],
-//! output is the per-expiry total variance `σ²_T` (already multiplied
-//! by `T`, since the 30-day interp in §4.6 operates in total-variance
-//! space — the caller divides by `T` to recover the annualised
-//! variance when it needs vol).
+//! output is the **annualised** per-expiry variance `σ²_T` (units of
+//! `1/year`). The 30-day interpolation in §4.6 works in total-variance
+//! space, where `total = σ²_T · T` — the `#19` caller multiplies by
+//! `T` itself; this function does **not** pre-multiply.
 //!
 //! Formula (§4.5):
 //!
@@ -43,9 +43,17 @@ pub enum VarianceError {
     )]
     NonFiniteIntegrand { idx: usize, strike: f64, q_usd: f64 },
     #[error(
+        "variance computation produced non-finite σ²_T = {0}; numeric overflow in `leading − correction` (forward / k_zero pathological)"
+    )]
+    NonFiniteResult(f64),
+    #[error(
         "Carr-Madan integral produced σ²_T = {0} < 0; §4.5 rejects (upstream IV surface is broken)"
     )]
     NegativeVariance(f64),
+    #[error(
+        "strip quotes are not strictly ascending in strike (idx {idx}: {left} ≥ {right}); trapezoidal sum would invert the integrand"
+    )]
+    UnsortedStrip { idx: usize, left: f64, right: f64 },
 }
 
 /// Compute the per-expiry total variance `σ²_T` for the supplied strip
@@ -66,6 +74,20 @@ pub fn variance_t_with_rate(strip: &Strip, r: f64) -> Result<f64, VarianceError>
     }
     if strip.quotes.len() < MIN_STRIP_QUOTES {
         return Err(VarianceError::TooFewQuotes(strip.quotes.len()));
+    }
+
+    // Monotonicity guard: `Strip` is a plain struct with public fields
+    // and the deserializer only checks length, not ordering — a cache /
+    // replay payload with a permuted quote would silently produce a
+    // wrong integral (negative `dk` subtracts instead of adds).
+    for (idx, win) in strip.quotes.windows(2).enumerate() {
+        if win[1].strike <= win[0].strike {
+            return Err(VarianceError::UnsortedStrip {
+                idx,
+                left: win[0].strike,
+                right: win[1].strike,
+            });
+        }
     }
 
     // Trapezoidal sum of f(K) = Q(K) / K² over the (non-uniform-tolerant)
@@ -104,20 +126,16 @@ pub fn variance_t_with_rate(strip: &Strip, r: f64) -> Result<f64, VarianceError>
     let sigma_sq_t = leading - correction;
 
     if !sigma_sq_t.is_finite() {
-        return Err(VarianceError::NonFiniteIntegrand {
-            idx: 0,
-            strike: f64::NAN,
-            q_usd: f64::NAN,
-        });
+        return Err(VarianceError::NonFiniteResult(sigma_sq_t));
     }
     if sigma_sq_t < 0.0 {
         return Err(VarianceError::NegativeVariance(sigma_sq_t));
     }
 
-    // §4.5 returns *annualised* variance σ²_T; the caller multiplies by
-    // T to recover total variance when working in §4.6's interpolation
-    // space. Naming-wise this is "sigma squared (annualised)" — the
-    // `_t` suffix in the issue body refers to "per-expiry" not "× T".
+    // §4.5 returns *annualised* variance σ²_T (units `1/year`); the
+    // §4.6 caller multiplies by T itself when moving to total-variance
+    // interpolation space. The `_t` suffix in the issue body refers to
+    // "per-expiry" not "× T".
     Ok(sigma_sq_t)
 }
 
@@ -313,14 +331,59 @@ mod tests {
         ));
     }
 
-    /// At `F == K₀` exactly, the correction term is zero and the
-    /// trapezoidal sum dominates. Smoke that the correction algebra
-    /// doesn't introduce a stray factor on the equality case.
+    /// At `F == K₀` exactly, the correction term is zero, so σ² must
+    /// equal the bare trapezoidal sum `(2/T) · Σ trap(Q/K²)`. Verifies
+    /// the correction algebra doesn't introduce a stray bias on the
+    /// equality case.
     #[test]
     fn zero_correction_when_forward_equals_k_zero() {
         let mut strip = flat_iv_strip(100.0, 4.0, 10, 0.25, 0.5);
         strip.k_zero = strip.forward;
         let sigma_sq = variance_t(&strip).unwrap();
-        assert!(sigma_sq > 0.0);
+
+        // Recompute the integral alone (no correction) and confirm σ²
+        // equals exactly `(2/T) · integral`.
+        let mut integral = 0.0_f64;
+        for win in strip.quotes.windows(2) {
+            let fa = win[0].q_usd / (win[0].strike * win[0].strike);
+            let fb = win[1].q_usd / (win[1].strike * win[1].strike);
+            integral += 0.5 * (fa + fb) * (win[1].strike - win[0].strike);
+        }
+        let expected = 2.0 / strip.time_to_expiry.0 * integral;
+        assert!(
+            (sigma_sq - expected).abs() < 1e-12,
+            "σ²={sigma_sq} expected={expected}"
+        );
+    }
+
+    /// Regression for HIGH-2 (review of #18): a `Strip` whose quotes
+    /// were permuted (e.g. by a buggy cache deserializer) must be
+    /// rejected with `UnsortedStrip`, not silently integrated with a
+    /// flipped-sign window.
+    #[test]
+    fn rejects_unsorted_quotes() {
+        let mut strip = flat_iv_strip(100.0, 4.0, 10, 0.25, 0.5);
+        // Swap quotes[100] and quotes[101] — a single inversion is
+        // enough to flip the trapezoidal contribution of one segment.
+        strip.quotes.swap(100, 101);
+        assert!(matches!(
+            variance_t(&strip),
+            Err(VarianceError::UnsortedStrip { .. })
+        ));
+    }
+
+    /// Regression for HIGH-2: a pathological `Strip` where the
+    /// `(F/K₀ − 1)²` correction overflows to `Inf` must produce
+    /// `NonFiniteResult`, not the misleading `NonFiniteIntegrand`.
+    #[test]
+    fn rejects_non_finite_result() {
+        // f64::MAX / 1e-300 ≈ Inf; squaring it overflows.
+        let mut strip = flat_iv_strip(100.0, 4.0, 10, 0.25, 0.5);
+        strip.forward = f64::MAX;
+        strip.k_zero = 1e-300;
+        assert!(matches!(
+            variance_t(&strip),
+            Err(VarianceError::NonFiniteResult(_))
+        ));
     }
 }
