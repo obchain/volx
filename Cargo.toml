@@ -59,6 +59,10 @@ clickhouse         = { version = "0.15", default-features = false, features = ["
 # Redis pubsub fanout for live consumers (#16). `tokio-comp` is the only
 # async backend we need; TLS lands when a managed Redis is wired in M3.
 redis              = { version = "0.25", default-features = false, features = ["tokio-comp", "keep-alive"] }
+# `libm` over `std::f64` because `erf` is not in std. Tiny pure-Rust crate,
+# no transitive deps. Used by the engine BS pricer (#17) for the normal
+# CDF in `erf(x / sqrt(2))` form.
+libm               = { version = "0.2" }
 
 # Centralized lint policy. Individual crates inherit via:
 #   [lints]
