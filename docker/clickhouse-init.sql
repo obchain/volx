@@ -20,10 +20,12 @@ CREATE DATABASE IF NOT EXISTS volx;
 -- options_ticks — raw market data
 -- ---------------------------------------------------------------------------
 --
--- ORDER BY (asset, expiry, strike, ts):
+-- ORDER BY (asset, expiry, strike, venue, ts):
 --   queries always filter by (asset, expiry) at minimum (engine strip
---   builder), often also (strike). `ts` last so per-strike scans stay
---   chronological.
+--   builder), often also (strike). `venue` slots in before `ts` so
+--   per-venue scans + dedup retain a tight primary-key prefix — the
+--   3-value venue cardinality makes this essentially free. `ts` last
+--   so per-strike scans stay chronological.
 --
 -- PARTITION BY toYYYYMM(ts):
 --   monthly partitions give a clean drop boundary for the TTL.
@@ -36,11 +38,26 @@ CREATE DATABASE IF NOT EXISTS volx;
 --   ~15-20× compression ratio over uncompressed Float64 on the
 --   measured tick stream. Level 3 is the standard speed / ratio knee.
 
+-- Codec choices:
+--   ZSTD(3)         — standard speed / ratio knee for wide Float64.
+--   Delta + ZSTD    — monotonic-ish timestamps compress dramatically
+--                     better than plain ZSTD; tick-time and received-at
+--                     both qualify.
+--   Plain ZSTD on `expiry` — non-monotonic but low-cardinality, so
+--                     ZSTD alone handles it; Delta would add no value.
+--
+-- Nullable(Float64) on bid/ask/mid/iv mirrors Option<f64> from the
+-- shared-types crate. The Nullable null-map adds a small per-row cost
+-- and disables some skip indexes; if engine profiling shows this is
+-- hot we can switch to a `NaN` sentinel and document the convention
+-- (the driver mapping for Option<f64> ↔ NaN is one of the things the
+-- normalizer (#16) decides when it picks a ClickHouse client).
+
 CREATE TABLE IF NOT EXISTS volx.options_ticks
 (
     venue          LowCardinality(String),                     -- deribit / okx / bybit
     asset          LowCardinality(String),                     -- btc / eth
-    expiry         DateTime64(3, 'UTC'),
+    expiry         DateTime64(3, 'UTC')             CODEC(ZSTD(3)),
     strike         Float64                          CODEC(ZSTD(3)),
     kind           LowCardinality(String),                     -- call / put
     bid            Nullable(Float64)                CODEC(ZSTD(3)),
@@ -50,16 +67,16 @@ CREATE TABLE IF NOT EXISTS volx.options_ticks
     underlying     Float64                          CODEC(ZSTD(3)),
     open_interest  Float64                          CODEC(ZSTD(3)),
     volume_24h     Float64                          CODEC(ZSTD(3)),
-    received_at    DateTime64(3, 'UTC'),
+    received_at    DateTime64(3, 'UTC')             CODEC(Delta, ZSTD(3)),
     -- `ts` is the canonical timestamp the engine sorts on. We default to
     -- received_at so the writer doesn't have to compute it; an explicit
     -- value can still be supplied if a venue ever publishes a separate
     -- event-time vs. ingest-time.
-    ts             DateTime64(3, 'UTC')             DEFAULT received_at
+    ts             DateTime64(3, 'UTC')             DEFAULT received_at  CODEC(Delta, ZSTD(3))
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
-ORDER BY (asset, expiry, strike, ts)
+ORDER BY (asset, expiry, strike, venue, ts)
 TTL toDate(ts) + INTERVAL 1 YEAR
 SETTINGS index_granularity = 8192;
 
@@ -74,13 +91,24 @@ SETTINGS index_granularity = 8192;
 -- `strip_hash` is FixedString(32): matches `volx_shared_types::StripHash([u8; 32])`.
 -- The JSON wire format (hex64) is the API layer's concern.
 
+-- Replay semantics:
+--   `index_ticks` is `MergeTree`, not `ReplacingMergeTree` — so a
+--   re-INSERT of the same (index_id, ts) row will accumulate in the
+--   base table. The `index_1m_mv` materialized view fires on every
+--   INSERT block, so a duplicate insert would also double-count in
+--   `count_state` and skew `avg_conf_state`. The engine publisher
+--   (#20) must dedupe before insert (e.g. via a per-instance
+--   "already-published timestamps" set, or an idempotency token).
+--   We deliberately keep the table simple here so the dedup
+--   responsibility sits on the producer, not on storage.
+
 CREATE TABLE IF NOT EXISTS volx.index_ticks
 (
     index_id    LowCardinality(String),                       -- BVOL / EVOL
     value       Float64                             CODEC(ZSTD(3)),
     confidence  Float64                             CODEC(ZSTD(3)),
     strip_hash  FixedString(32),
-    ts          DateTime64(3, 'UTC')
+    ts          DateTime64(3, 'UTC')                CODEC(Delta, ZSTD(3))
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
