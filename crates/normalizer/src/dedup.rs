@@ -89,9 +89,24 @@ pub struct Deduper {
 }
 
 impl Deduper {
-    /// Build a deduper with explicit window + cap.
+    /// Build a deduper with explicit window + cap. `window` must be a
+    /// positive duration; a zero-or-negative value would cause every tick
+    /// to be evicted before the duplicate check could see it. `max_entries`
+    /// must be at least 1 so the size cap can never reject the very tick
+    /// that triggered the insert.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `window == Duration::ZERO` or `max_entries == 0` —
+    /// programmer errors that should be caught at the first start, not
+    /// silently at the first tick.
     #[must_use]
     pub fn new(window: Duration, max_entries: usize) -> Self {
+        assert!(
+            !window.is_zero(),
+            "Deduper window must be positive (got zero)"
+        );
+        assert!(max_entries >= 1, "Deduper max_entries must be >= 1 (got 0)");
         Self {
             window,
             max_entries,
@@ -100,13 +115,12 @@ impl Deduper {
         }
     }
 
-    /// Build using the project defaults (60 s window, 240 k cap).
+    /// Build using the project defaults (60 s window, 240 k cap). Single
+    /// source of truth: delegate through `NormalizerConfig::default()` so a
+    /// future change to a default in one place can't drift between the two.
     #[must_use]
     pub fn with_defaults() -> Self {
-        Self::new(
-            Duration::from_secs_f64(crate::config::DEFAULT_DEDUP_WINDOW_SECS),
-            crate::config::DEFAULT_DEDUP_MAX_ENTRIES,
-        )
+        Self::from_config(&crate::config::NormalizerConfig::default())
     }
 
     /// Build from the normalizer config.
@@ -149,15 +163,19 @@ impl Deduper {
         DedupOutcome::Fresh
     }
 
-    /// Pop entries off the front whose `received_at` is older than
-    /// `now − window`. O(k) where k is the number of expired entries.
+    /// Pop entries off the front whose `received_at` is at or older than
+    /// `now − window`. The `<=` boundary is deliberate: an entry whose age
+    /// is *exactly* the window is treated as outside it (window is
+    /// half-open `[now − window, now)`). O(k) where k is the number of
+    /// expired entries.
     fn evict_old(&mut self, now: OffsetDateTime) {
         let cutoff = now - time::Duration::try_from(self.window).unwrap_or(time::Duration::ZERO);
         while let Some(&(ts, _)) = self.queue.front() {
-            if ts < cutoff {
-                if let Some((_, key)) = self.queue.pop_front() {
-                    self.seen.remove(&key);
-                }
+            if ts <= cutoff {
+                // pop_front is guaranteed to succeed: we just peeked and
+                // nothing else mutates the queue between the two ops.
+                let (_, key) = self.queue.pop_front().expect("queue.front was Some");
+                self.seen.remove(&key);
             } else {
                 break;
             }
@@ -166,14 +184,16 @@ impl Deduper {
 
     /// Pop the oldest entries until size is under the cap. Runs after every
     /// fresh insert; under normal load this is a no-op because time-based
-    /// eviction keeps `len` well below `max_entries`.
+    /// eviction keeps `len` well below `max_entries`. By construction
+    /// `seen.len() == queue.len()`, so `pop_front` is guaranteed to succeed
+    /// whenever the loop condition is true.
     fn enforce_size_cap(&mut self) {
         while self.seen.len() > self.max_entries {
-            if let Some((_, key)) = self.queue.pop_front() {
-                self.seen.remove(&key);
-            } else {
-                break;
-            }
+            let (_, key) = self
+                .queue
+                .pop_front()
+                .expect("queue + seen invariant: equal length");
+            self.seen.remove(&key);
         }
     }
 }
@@ -347,12 +367,41 @@ mod tests {
     }
 
     #[test]
-    fn unix_ms_round_trip() {
-        let t = datetime!(2026-05-25 12:34:56.789 UTC);
+    fn unix_ms_truncates_to_millisecond() {
+        // Fixture lands on the ms boundary; reading back at ms resolution
+        // must match. Sub-millisecond components are *intentionally*
+        // truncated by `unix_ms` so the assertion compares ms-truncated
+        // values rather than the raw `OffsetDateTime`.
+        let t = datetime!(2026-05-25 12:34:56.789_111_222 UTC);
         let ms = unix_ms(t);
-        // Sanity-check it round-trips to the same millisecond.
-        let back = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).unwrap();
-        assert_eq!(back, t);
+        let expected_ms = i64::try_from(t.unix_timestamp_nanos() / 1_000_000).unwrap();
+        assert_eq!(ms, expected_ms);
+    }
+
+    #[test]
+    fn entry_exactly_at_window_boundary_is_evicted() {
+        // METHODOLOGY interpretation: window is `[now − window, now)` —
+        // an entry whose age is *exactly* the window length is treated as
+        // outside it. A repeat at `t0 + 60 s` (= window) sees an empty
+        // cache and is `Fresh`, not `Duplicate`.
+        let mut d = Deduper::with_defaults();
+        let t = tick_at(t0(), 70_000.0);
+        assert_eq!(d.check(&t, t0()), DedupOutcome::Fresh);
+        let at_boundary = t0() + time::Duration::seconds(60);
+        assert_eq!(d.check(&t, at_boundary), DedupOutcome::Fresh);
+        assert_eq!(d.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be positive")]
+    fn zero_window_panics_at_construction() {
+        let _ = Deduper::new(Duration::ZERO, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be >= 1")]
+    fn zero_max_entries_panics_at_construction() {
+        let _ = Deduper::new(Duration::from_secs(60), 0);
     }
 
     #[test]
