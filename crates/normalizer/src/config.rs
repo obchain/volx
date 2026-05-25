@@ -12,8 +12,16 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_MAX_AGE_SECS: f64 = 5.0;
 /// Default `(ask − bid) / mid` cap. METHODOLOGY.md §3.1 — spread filter.
 const DEFAULT_MAX_SPREAD_RATIO: f64 = 0.30;
-/// Default below-intrinsic tolerance (USD). METHODOLOGY.md §3.1.
-const DEFAULT_INTRINSIC_TOLERANCE: f64 = 1e-9;
+/// Default below-intrinsic tolerance (USD). METHODOLOGY.md §3.1 specifies
+/// `1e-9` as a numerical tolerance; that value is well below any realistic
+/// venue quote tick size and would produce false `BelowIntrinsic` drops on
+/// deep-ITM options after the per-venue coin → USD conversion. We use
+/// `0.01` (one cent) — comfortably above f64 rounding noise at all
+/// realistic price scales (BTC mid prices reach $20k+) and below the
+/// smallest Deribit price-tick spread (~$0.07 at current underlying). A
+/// quote >= 1 c below intrinsic is genuine arb signal; less than that is
+/// indistinguishable from venue rounding.
+const DEFAULT_INTRINSIC_TOLERANCE: f64 = 1e-2;
 
 const fn default_max_age_secs() -> f64 {
     DEFAULT_MAX_AGE_SECS
@@ -28,9 +36,14 @@ const fn default_intrinsic_tolerance() -> f64 {
 /// Thresholds for the per-tick filter pipeline.
 ///
 /// `serde(default)` on every field means a partial TOML overrides only the
-/// fields it mentions; everything else keeps the methodology default. This
-/// keeps configs forward-compatible: future filters can land without
-/// breaking existing deployments.
+/// fields it mentions; everything else keeps the methodology default. New
+/// fields can be added in future releases without breaking *existing*
+/// configs (the old file just doesn't mention the new field).
+///
+/// **`deny_unknown_fields` caveat:** the typo guard makes downgrades
+/// asymmetric — once an operator writes a TOML that mentions a field
+/// introduced in version N, rolling back to a binary < N will reject the
+/// config. Regenerate the TOML when downgrading.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NormalizerConfig {
@@ -79,7 +92,10 @@ mod tests {
         let c = NormalizerConfig::default();
         assert!((c.max_age_secs - 5.0).abs() < 1e-12);
         assert!((c.max_spread_ratio - 0.30).abs() < 1e-12);
-        assert!((c.intrinsic_tolerance - 1e-9).abs() < 1e-20);
+        // METHODOLOGY §3.1 quotes 1e-9; we use 1e-2 (1 c) to absorb the
+        // per-venue coin→USD conversion rounding without false drops on
+        // deep ITM options. See config.rs `DEFAULT_INTRINSIC_TOLERANCE`.
+        assert!((c.intrinsic_tolerance - 1e-2).abs() < 1e-12);
     }
 
     #[test]

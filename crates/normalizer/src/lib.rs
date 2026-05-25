@@ -107,17 +107,25 @@ impl Normalizer {
     /// time so behaviour is reproducible.
     #[must_use]
     pub fn check_tick(&self, tick: &OptionTick, now: OffsetDateTime) -> FilterOutcome {
-        // 1. Staleness.
+        // 1. Staleness. `time::Duration` is signed; a tick whose
+        //    `received_at` is in the future (venue clock skew, replayed
+        //    fixture, etc.) yields a negative age and would silently pass
+        //    a naive `> max_age` test. Treat future-dated ticks as stale
+        //    too — they are just as suspect as old ones.
         let age_secs = (now - tick.received_at).as_seconds_f64();
-        if age_secs > self.config.max_age_secs {
+        if !(0.0..=self.config.max_age_secs).contains(&age_secs) {
             return Self::record_drop(FilterReason::Stale);
         }
 
         // 2. Crossed / locked. Needs both sides; if either is missing the
         //    quote is incomplete and a different filter (or engine layer)
-        //    handles it.
+        //    handles it. A negative bid or ask means the book itself is
+        //    malformed (some venues briefly publish negatives during a
+        //    disconnect-replay race); roll that into `Crossed` rather than
+        //    inventing a new label that would mislabel the symptom — the
+        //    quote is "not a valid two-sided market," same root cause.
         if let (Some(bid), Some(ask)) = (tick.bid, tick.ask)
-            && ask <= bid
+            && (ask <= bid || bid < 0.0 || ask < 0.0)
         {
             return Self::record_drop(FilterReason::Crossed);
         }
@@ -356,5 +364,77 @@ mod tests {
         assert_eq!(FilterReason::Crossed.as_label(), "crossed");
         assert_eq!(FilterReason::WideSpread.as_label(), "wide_spread");
         assert_eq!(FilterReason::BelowIntrinsic.as_label(), "below_intrinsic");
+    }
+
+    #[test]
+    fn future_dated_quote_dropped_as_stale() {
+        // Negative age (clock skew). A naive `> max_age` test would let
+        // this slip through; we reject it as `Stale` so a corrupt
+        // received_at can't pose as fresh data.
+        let n = Normalizer::with_defaults();
+        let mut tick = fresh_tick(now());
+        tick.received_at = now() + time::Duration::seconds(2);
+        assert_eq!(
+            n.check_tick(&tick, now()),
+            FilterOutcome::Drop(FilterReason::Stale)
+        );
+    }
+
+    #[test]
+    fn negative_bid_dropped_as_crossed() {
+        // Malformed book (venue glitch) — roll into the Crossed label.
+        let n = Normalizer::with_defaults();
+        let mut tick = fresh_tick(now());
+        tick.bid = Some(-1.0);
+        tick.ask = Some(2_550.0);
+        assert_eq!(
+            n.check_tick(&tick, now()),
+            FilterOutcome::Drop(FilterReason::Crossed)
+        );
+    }
+
+    #[test]
+    fn negative_ask_dropped_as_crossed() {
+        let n = Normalizer::with_defaults();
+        let mut tick = fresh_tick(now());
+        tick.bid = Some(0.0);
+        tick.ask = Some(-0.5);
+        assert_eq!(
+            n.check_tick(&tick, now()),
+            FilterOutcome::Drop(FilterReason::Crossed)
+        );
+    }
+
+    #[test]
+    fn zero_bid_not_crossed() {
+        // Empty bid side (`bid == 0`) is not "malformed"; it's common on
+        // illiquid deep OTM options. The book is not crossed — the spread
+        // filter (separately) will drop the tick because spread/mid = 2
+        // always when bid is 0. We only assert the failure isn't mislabeled
+        // as `Crossed`.
+        let n = Normalizer::with_defaults();
+        let mut tick = fresh_tick(now());
+        tick.bid = Some(0.0);
+        tick.ask = Some(0.0001);
+        tick.mid = Some(0.00005);
+        assert_eq!(
+            n.check_tick(&tick, now()),
+            FilterOutcome::Drop(FilterReason::WideSpread)
+        );
+    }
+
+    #[test]
+    fn intrinsic_tolerance_absorbs_venue_rounding() {
+        // Deep ITM call: strike 50k, underlying 70k → intrinsic 20k.
+        // Mid is one-tenth of a cent below intrinsic — well within
+        // typical venue coin→USD conversion rounding. Must pass.
+        let n = Normalizer::with_defaults();
+        let mut tick = fresh_tick(now());
+        tick.strike = 50_000.0;
+        tick.underlying = 70_000.0;
+        tick.mid = Some(19_999.999);
+        tick.bid = Some(19_999.0);
+        tick.ask = Some(20_001.0);
+        assert_eq!(n.check_tick(&tick, now()), FilterOutcome::Pass);
     }
 }
