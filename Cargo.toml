@@ -63,6 +63,10 @@ redis              = { version = "0.25", default-features = false, features = ["
 # no transitive deps. Used by the engine BS pricer (#17) for the normal
 # CDF in `erf(x / sqrt(2))` form.
 libm               = { version = "0.2" }
+# SHA-256 for the engine's `strip_hash` audit field (#20). Default-features
+# off keeps the dep slim; the `oid` / `asm` extras would only matter if we
+# stored hashes alongside PKI metadata, which we do not.
+sha2               = { version = "0.10", default-features = false, features = ["std"] }
 
 # Centralized lint policy. Individual crates inherit via:
 #   [lints]

@@ -1,0 +1,252 @@
+//! Chain assembler — turns the per-tick `options_ticks` table into
+//! per-expiry [`ExpiryChain`] snapshots the strip builder can consume
+//! (issue #20).
+//!
+//! Reads the **latest** tick per `(asset, expiry, strike, kind)` within
+//! a freshness window (default 30 s) directly from `ClickHouse`. The
+//! engine deliberately reads the system of record rather than the
+//! Redis pubsub firehose so a recoverable snapshot lands every 60 s
+//! even if the normalizer's Redis sink is degraded.
+//!
+//! Per-asset snapshots are returned as a `HashMap<expiry, ChainLeg[]>`
+//! so the §4.1 expiry picker (in `snapshot.rs`) can pick near + next
+//! without re-scanning.
+//!
+//! ## Year-fraction convention
+//!
+//! `time_to_expiry` is computed as `(expiry − ts) / (365 · 86400) s`.
+//! `N_365` from `METHODOLOGY.md` §4.6 = 525 600 minutes = 31 536 000 s.
+//! Using 365 (not 365.25) matches the spec; downstream `Minutes` math
+//! in `interpolate.rs` is consistent.
+
+use std::collections::HashMap;
+
+use clickhouse::Client;
+use serde::Deserialize;
+use time::OffsetDateTime;
+use tracing::{debug, warn};
+use volx_shared_types::units::Years;
+use volx_shared_types::{Asset, OptionKind};
+
+use crate::strip::{ChainLeg, ExpiryChain};
+
+/// Seconds in a year per `METHODOLOGY.md` §4.6 (`N_365 = 365·1440·60`).
+const SECONDS_PER_YEAR: f64 = 365.0 * 24.0 * 60.0 * 60.0;
+
+/// Freshness window for the latest-tick query. Ticks older than this are
+/// excluded — staleness in the source feed should not silently feed the
+/// engine a 5-minute-old quote.
+///
+/// 30 s is `6×` the normalizer's `max_age_secs` default (5 s). A larger
+/// window than that would let a feed outage masquerade as a live snapshot.
+pub const SNAPSHOT_FRESHNESS_SECS: u32 = 30;
+
+/// Wire row from the `argMax(...) GROUP BY ...` query below.
+#[derive(Debug, Deserialize, clickhouse::Row)]
+struct ChainRow {
+    asset: String,
+    #[serde(with = "clickhouse::serde::time::datetime64::millis")]
+    expiry: OffsetDateTime,
+    strike: f64,
+    kind: String,
+    bid: Option<f64>,
+    ask: Option<f64>,
+    mid: Option<f64>,
+    iv: Option<f64>,
+    underlying: f64,
+}
+
+/// Why a chain build can fail.
+#[derive(Debug, thiserror::Error)]
+pub enum ChainError {
+    #[error("clickhouse error: {0}")]
+    ClickHouse(#[from] clickhouse::error::Error),
+}
+
+/// Per-expiry chains keyed by `(asset, expiry)`. The expiry-picker step
+/// in `snapshot.rs` consumes one `Asset` at a time, so the outer map
+/// keys on `Asset` and the inner map on `OffsetDateTime`.
+pub type AssetChains = HashMap<Asset, HashMap<OffsetDateTime, ExpiryChain>>;
+
+/// Pull the latest tick per `(asset, expiry, strike, kind)` from
+/// `ClickHouse` and assemble per-expiry chains.
+///
+/// `now` is the snapshot timestamp — used for the freshness filter and
+/// for the `time_to_expiry` computation. The scheduler (#20) passes a
+/// fresh `OffsetDateTime::now_utc()` per 60-second tick.
+///
+/// # Errors
+///
+/// Returns `Err` only on a `ClickHouse` driver / network failure. An
+/// empty result (no ticks in the window) is a valid empty chain, not
+/// an error — `snapshot.rs` decides whether to publish or skip.
+///
+/// # Panics
+///
+/// Does not panic; the `unwrap_or(0)` clamp on the cutoff conversion
+/// degrades to a no-op `WHERE ts >= 0` rather than aborting.
+pub async fn fetch_chains(client: &Client, now: OffsetDateTime) -> Result<AssetChains, ChainError> {
+    let cutoff_ms = i64::try_from(
+        now.unix_timestamp_nanos() / 1_000_000 - i128::from(SNAPSHOT_FRESHNESS_SECS) * 1000,
+    )
+    .unwrap_or(0);
+
+    // `argMax(field, ts)` picks the field value at the row with the
+    // largest `ts` in the group — i.e. the *latest* observation per
+    // instrument. The `ts >= cutoff` filter drops stale rows so a
+    // dead feed doesn't masquerade as a live snapshot.
+    let query = "
+        SELECT
+            asset,
+            expiry,
+            strike,
+            kind,
+            argMax(bid, ts)        AS bid,
+            argMax(ask, ts)        AS ask,
+            argMax(mid, ts)        AS mid,
+            argMax(iv,  ts)        AS iv,
+            argMax(underlying, ts) AS underlying
+        FROM volx.options_ticks
+        WHERE ts >= fromUnixTimestamp64Milli(?)
+        GROUP BY asset, expiry, strike, kind
+    ";
+
+    let rows: Vec<ChainRow> = client
+        .query(query)
+        .bind(cutoff_ms)
+        .fetch_all::<ChainRow>()
+        .await?;
+
+    debug!(
+        rows = rows.len(),
+        cutoff_ms, "fetched latest ticks for chain build"
+    );
+
+    let mut out: AssetChains = HashMap::new();
+    for row in rows {
+        let Some(asset) = parse_asset(&row.asset) else {
+            warn!(asset = %row.asset, "unknown asset in options_ticks; skipping");
+            continue;
+        };
+        let Some(kind) = parse_kind(&row.kind) else {
+            warn!(kind = %row.kind, "unknown option kind; skipping");
+            continue;
+        };
+        if !row.strike.is_finite() || row.strike <= 0.0 {
+            continue;
+        }
+
+        let per_asset = out.entry(asset).or_default();
+        let chain = per_asset.entry(row.expiry).or_insert_with(|| ExpiryChain {
+            time_to_expiry: year_fraction(now, row.expiry),
+            legs: Vec::new(),
+        });
+
+        // The `argMax` query yields one row per `(asset, expiry, strike,
+        // kind)`. Fold call + put rows for the same strike into a
+        // single `ChainLeg`.
+        let leg = if let Some(existing) = chain
+            .legs
+            .iter_mut()
+            .find(|l| (l.strike - row.strike).abs() < f64::EPSILON)
+        {
+            existing
+        } else {
+            chain.legs.push(ChainLeg {
+                strike: row.strike,
+                ..ChainLeg::default()
+            });
+            chain.legs.last_mut().expect("just pushed")
+        };
+
+        // `mid` may be null in the source (normalizer dropped one side
+        // of a quote); the strip builder is OK with `None` and the
+        // §4.2 forward picker filters strikes where either leg is
+        // missing.
+        match kind {
+            OptionKind::Call => {
+                leg.call_mid_usd = row.mid.filter(|v| v.is_finite());
+                leg.call_iv = row.iv.filter(|v| v.is_finite());
+            }
+            OptionKind::Put => {
+                leg.put_mid_usd = row.mid.filter(|v| v.is_finite());
+                leg.put_iv = row.iv.filter(|v| v.is_finite());
+            }
+        }
+
+        let _ = (row.bid, row.ask, row.underlying); // currently unused at chain level; reserved for future filters
+    }
+
+    Ok(out)
+}
+
+fn parse_asset(s: &str) -> Option<Asset> {
+    match s {
+        "btc" => Some(Asset::Btc),
+        "eth" => Some(Asset::Eth),
+        _ => None,
+    }
+}
+
+fn parse_kind(s: &str) -> Option<OptionKind> {
+    match s {
+        "call" => Some(OptionKind::Call),
+        "put" => Some(OptionKind::Put),
+        _ => None,
+    }
+}
+
+/// Year-fraction between `now` and `expiry` per `METHODOLOGY.md` §4.6
+/// `N_365` convention (365 days, not 365.25).
+#[must_use]
+pub fn year_fraction(now: OffsetDateTime, expiry: OffsetDateTime) -> Years {
+    let secs = (expiry - now).as_seconds_f64();
+    Years(secs / SECONDS_PER_YEAR)
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    #[test]
+    fn year_fraction_30_days_is_30_over_365() {
+        let now = datetime!(2026-05-25 00:00:00 UTC);
+        let expiry = now + time::Duration::days(30);
+        let yf = year_fraction(now, expiry);
+        assert!((yf.0 - 30.0 / 365.0).abs() < 1e-12, "got {}", yf.0);
+    }
+
+    #[test]
+    fn year_fraction_one_year_is_one() {
+        let now = datetime!(2026-01-01 00:00:00 UTC);
+        let expiry = datetime!(2027-01-01 00:00:00 UTC);
+        let yf = year_fraction(now, expiry);
+        // 365 days exactly per the §4.6 convention.
+        assert!((yf.0 - 1.0).abs() < 1e-12, "got {}", yf.0);
+    }
+
+    #[test]
+    fn year_fraction_past_expiry_is_negative() {
+        let now = datetime!(2026-05-25 00:00:00 UTC);
+        let expiry = now - time::Duration::days(1);
+        let yf = year_fraction(now, expiry);
+        assert!(yf.0 < 0.0);
+    }
+
+    #[test]
+    fn parse_asset_known_variants() {
+        assert_eq!(parse_asset("btc"), Some(Asset::Btc));
+        assert_eq!(parse_asset("eth"), Some(Asset::Eth));
+        assert_eq!(parse_asset("BTC"), None); // case-sensitive — normalizer writes lowercase
+        assert_eq!(parse_asset("doge"), None);
+    }
+
+    #[test]
+    fn parse_kind_known_variants() {
+        assert_eq!(parse_kind("call"), Some(OptionKind::Call));
+        assert_eq!(parse_kind("put"), Some(OptionKind::Put));
+        assert_eq!(parse_kind("straddle"), None);
+    }
+}
