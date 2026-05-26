@@ -30,10 +30,12 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/adaptor"
 
 	"github.com/obchain/volx/api/internal/config"
 	"github.com/obchain/volx/api/internal/handlers"
 	"github.com/obchain/volx/api/internal/storage"
+	"github.com/obchain/volx/api/internal/stream"
 )
 
 func main() {
@@ -107,6 +109,19 @@ func main() {
 	v1.Get("/index/:id/latest", handlers.IndexLatest(indexDeps))
 	v1.Get("/index/:id/history", handlers.IndexHistory(indexDeps))
 	v1.Get("/options/strip", handlers.OptionsStrip(indexDeps))
+
+	// WebSocket live stream (#24). One hub per process, started in
+	// a goroutine alongside the fiber listener; the hub keeps a
+	// single Redis PSUBSCRIBE open and fans every published tick
+	// to the per-conn channels created by `stream.Handler`. The
+	// IP limiter caps anon connections per PRD §6.
+	hubCtx, hubCancel := context.WithCancel(context.Background())
+	defer hubCancel()
+	hub := stream.NewHub(rds.Client)
+	go hub.Run(hubCtx)
+	ipLimit := stream.NewIPLimiter(cfg.WSMaxConnsPerIP)
+	v1.Get("/stream", adaptor.HTTPHandler(stream.Handler(hub, ipLimit)))
+	slog.Info("ws stream wired", "path", "/v1/stream", "per_ip_cap", cfg.WSMaxConnsPerIP)
 
 	// Run the listener in its own goroutine so `main` can wait on
 	// signal + shutdown sequentially.

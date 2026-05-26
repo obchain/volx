@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.46.0
 	github.com/gofiber/fiber/v3 v3.3.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/redis/go-redis/v9 v9.19.0
 )
 
