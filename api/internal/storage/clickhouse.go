@@ -122,6 +122,22 @@ type HistoryInterval struct {
 // AllowedHistoryIntervals lists the buckets supported by
 // `/v1/index/{id}/history`. Pinned per PRD §6 — extending requires a
 // wire-format bump.
+//
+// `toStartOfInterval(ts, INTERVAL N MINUTE)` aligns each bucket to a
+// multiple of N minutes counted from the Unix epoch
+// (`1970-01-01 00:00:00 UTC`). For the four pinned intervals this
+// produces the expected calendar alignment:
+//
+//	1m  → minute-of-hour boundary
+//	5m  → 00, 05, 10, … minutes of the hour
+//	1h  → top of the hour (UTC)
+//	1d  → 00:00 UTC (1440 min × N is always a multiple of one UTC day)
+//
+// The 1-day case is correct by epoch-alignment coincidence — `1440`
+// minutes divides every UTC day exactly. If a future interval like
+// `12h` is added it would also align cleanly (720 min → 00:00 and
+// 12:00 UTC). Non-day multiples (e.g. `90m`) would NOT respect
+// calendar boundaries; add a translation layer there if needed.
 var AllowedHistoryIntervals = []HistoryInterval{
 	{"1m", 1},
 	{"5m", 5},

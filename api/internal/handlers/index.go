@@ -102,15 +102,21 @@ func IndexLatest(d IndexDeps) fiber.Handler {
 		}
 
 		// `next_update_eta_seconds` = how long until the engine is
-		// expected to publish the next tick. Clamp at zero so a
-		// stale value (engine paused) doesn't surface a negative
-		// number to the consumer's countdown UI.
+		// expected to publish the next tick. Clamp on both ends:
+		// `< 0` (engine paused, ts is far in the past) → 0;
+		// `> 60` (clock skew or future-dated test ts) → 60. The
+		// countdown UI (#27) keys on this; an out-of-range value
+		// would flicker the dashboard or show a > 60 s countdown
+		// for an index that publishes every 60 s.
 		eta := enginePublishIntervalSecs
 		if t, err := time.Parse(time.RFC3339Nano, src.Ts); err == nil {
 			elapsed := int(time.Since(t).Seconds())
 			eta = enginePublishIntervalSecs - elapsed
 			if eta < 0 {
 				eta = 0
+			}
+			if eta > enginePublishIntervalSecs {
+				eta = enginePublishIntervalSecs
 			}
 		}
 
@@ -186,9 +192,16 @@ func IndexHistory(d IndexDeps) fiber.Handler {
 				"error": "clickhouse history query failed",
 			})
 		}
+		// `order: "oldest_first"` makes the pagination contract
+		// explicit: `limit=N` returns the **most recent N bars**,
+		// then orders them oldest → newest. Frontend
+		// (lightweight-charts) requires ascending time on
+		// `setData()`, so this matches the consumer's expectation
+		// without forcing a reverse pass client-side.
 		return c.JSON(fiber.Map{
 			"index":    ticker,
 			"interval": intervalRaw,
+			"order":    "oldest_first",
 			"bars":     rows,
 		})
 	}
