@@ -37,9 +37,15 @@ import (
 )
 
 func main() {
-	// `slog` JSON to stdout — matches the Rust crates' `RUST_LOG_FORMAT=json`
-	// posture so a single log aggregator (Loki / Vector / promtail)
-	// can ingest both runtimes with one parser.
+	// `slog` JSON to stdout.
+	//
+	// The Rust crates emit JSON via `tracing_subscriber::fmt().json()`
+	// with keys `timestamp / level / fields.message / target`. Go's
+	// `slog` JSON handler emits `time / level / msg`. The two shapes
+	// are intentionally *not* identical — the unified Vector / Loki
+	// parser pipeline (#28) has separate field-renaming rules per
+	// source. Both encodings are still one-event-per-line JSON, which
+	// is what matters for ingestion at all.
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{}))
 	slog.SetDefault(logger)
 

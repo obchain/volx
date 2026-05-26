@@ -12,10 +12,10 @@ package handlers
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+
 	"github.com/obchain/volx/api/internal/storage"
 )
 
@@ -31,11 +31,25 @@ type HealthDeps struct {
 
 // HealthResponse is the JSON body of `/v1/health`. Field order +
 // names match the issue #22 spec exactly — dashboards key on them.
+//
+// `last_update_age_s` carries a `-1.0` sentinel when no index_ticks
+// row exists yet (first boot, never-published engine). Without the
+// sentinel a `degraded` status would ship alongside
+// `last_update_age_s: 0.0`, which any numeric freshness alert
+// (`age_s < 90` = healthy) would silently treat as the freshest
+// possible reading. Consumers must check `status` first; the age
+// field is only meaningful when `status ∈ {"ok", "degraded"}` *and*
+// the value is non-negative.
 type HealthResponse struct {
 	Status           string  `json:"status"`
 	LastUpdateAgeSec float64 `json:"last_update_age_s"`
 	Version          string  `json:"version"`
 }
+
+// AgeSentinelNoTicks marks "no row in index_ticks yet" so a freshness
+// alert keying on `last_update_age_s < N` does not flag the
+// never-booted-engine case as healthy.
+const AgeSentinelNoTicks = -1.0
 
 // Health wires `GET /v1/health`.
 //
@@ -75,30 +89,25 @@ func Health(d HealthDeps) fiber.Handler {
 		}
 
 		status := "ok"
+		ageField := age.Seconds()
 		// `age == 0` happens on first boot before the engine has run
 		// a single tick — report "degraded" rather than "ok" so an
-		// operator notices an engine that never connected.
-		if age == 0 || age > d.MaxAge {
+		// operator notices an engine that never connected. Use the
+		// `AgeSentinelNoTicks` value rather than `0.0` so the JSON
+		// is not internally inconsistent (status=degraded but
+		// age=0.0 — fresh as can be).
+		switch {
+		case age == 0:
+			status = "degraded"
+			ageField = AgeSentinelNoTicks
+		case age > d.MaxAge:
 			status = "degraded"
 		}
 
 		return c.JSON(HealthResponse{
 			Status:           status,
-			LastUpdateAgeSec: age.Seconds(),
+			LastUpdateAgeSec: ageField,
 			Version:          d.Version,
 		})
 	}
-}
-
-// healthError keeps the explicit nil-deref guard documented; if a
-// future refactor passes an unset field the handler returns this
-// rather than panicking. Reserved for the wiring tests in #23.
-var errHealthDepsUnset = errors.New("health: deps unset (programmer error)")
-
-// EnsureDeps is exposed for handler-side guards in #23+ tests.
-func EnsureDeps(d HealthDeps) error {
-	if d.Clickhouse == nil || d.Redis == nil {
-		return errHealthDepsUnset
-	}
-	return nil
 }
