@@ -95,5 +95,138 @@ func (c *ClickHouse) LastIndexTickAge(ctx context.Context) (time.Duration, error
 	return time.Since(maxTs), nil
 }
 
+// OHLCRow is one bar of an aggregated index series. `Ts` is the
+// bucket start (UTC). `Count` is the number of underlying 60 s
+// engine ticks that landed in the bar; `AvgConfidence` is their
+// average confidence value. Lightweight-charts on the frontend
+// (#27) consumes `Ts / Open / High / Low / Close` directly.
+type OHLCRow struct {
+	Ts            time.Time `json:"ts"`
+	Open          float64   `json:"open"`
+	High          float64   `json:"high"`
+	Low           float64   `json:"low"`
+	Close         float64   `json:"close"`
+	Count         uint64    `json:"count"`
+	AvgConfidence float64   `json:"avg_confidence"`
+}
+
+// HistoryInterval is the validated aggregation interval. The string
+// form is the wire-format value the API exposes and the SQL form is
+// the `INTERVAL N MINUTE` literal we re-bucket the underlying
+// `index_1m` rollup with.
+type HistoryInterval struct {
+	wire string
+	mins int
+}
+
+// AllowedHistoryIntervals lists the buckets supported by
+// `/v1/index/{id}/history`. Pinned per PRD §6 — extending requires a
+// wire-format bump.
+var AllowedHistoryIntervals = []HistoryInterval{
+	{"1m", 1},
+	{"5m", 5},
+	{"1h", 60},
+	{"1d", 24 * 60},
+}
+
+// ParseHistoryInterval validates the `interval` query param.
+func ParseHistoryInterval(s string) (HistoryInterval, error) {
+	for _, hi := range AllowedHistoryIntervals {
+		if hi.wire == s {
+			return hi, nil
+		}
+	}
+	return HistoryInterval{}, fmt.Errorf("invalid interval %q (allowed: 1m, 5m, 1h, 1d)", s)
+}
+
+// IndexHistory pulls an OHLC series from the `index_1m`
+// AggregatingMergeTree rollup (#15), re-bucketed to the requested
+// interval. `limit` is the maximum number of bars returned, in
+// chronological order (oldest first) so the chart consumer can
+// `setData()` directly.
+//
+// `tickerID` is the ClickHouse `LowCardinality(String)` value
+// (`"BVOL" / "EVOL"`). The function trusts the caller has already
+// validated it against a known set (the handler does, via
+// `IndexId::from_ticker`-equivalent in the handler).
+//
+// `index_1m` stores Aggregate* state columns; merging them happens
+// inside the inner SELECT so the outer aggregation operates on
+// scalar `value` doubles.
+func (c *ClickHouse) IndexHistory(
+	ctx context.Context,
+	tickerID string,
+	hi HistoryInterval,
+	limit int,
+) ([]OHLCRow, error) {
+	if !validDBName.MatchString(c.DB) {
+		// Defence-in-depth — the same guard ran at OpenClickHouse,
+		// but a refactor that mutated c.DB would slip the check
+		// otherwise.
+		return nil, fmt.Errorf("clickhouse: invalid DB name %q", c.DB)
+	}
+	if limit <= 0 || limit > 10_000 {
+		return nil, fmt.Errorf("clickhouse: invalid limit %d (must be 1..=10_000)", limit)
+	}
+
+	// The inner SELECT merges the AggregateFunction states into
+	// per-minute scalars. The outer SELECT re-buckets those scalars
+	// to the requested interval. For `1m` the outer aggregation is
+	// a no-op (1-minute buckets re-grouped by 1 minute = identity).
+	q := fmt.Sprintf(`
+        SELECT
+            toStartOfInterval(bucket, INTERVAL ? MINUTE) AS ts,
+            argMin(open, bucket)                          AS open,
+            max(high)                                     AS high,
+            min(low)                                      AS low,
+            argMax(close, bucket)                         AS close,
+            sum(count_v)                                  AS cnt,
+            avg(avg_conf_v)                               AS avg_conf
+        FROM (
+            SELECT
+                bucket,
+                argMinMerge(open_state)  AS open,
+                argMaxMerge(close_state) AS close,
+                max(high)                AS high,
+                min(low)                 AS low,
+                countMerge(count_state)  AS count_v,
+                avgMerge(avg_conf_state) AS avg_conf_v
+            FROM %s.index_1m
+            WHERE index_id = ?
+            GROUP BY index_id, bucket
+        )
+        GROUP BY ts
+        ORDER BY ts DESC
+        LIMIT ?
+    `, c.DB)
+
+	rows, err := c.Conn.Query(ctx, q, hi.mins, tickerID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("clickhouse: history query: %w", err)
+	}
+	defer rows.Close()
+
+	// `index_1m` query above returns rows in DESC order so a small
+	// `limit` brings the newest bars. Reverse in-place at the end
+	// so the wire format is oldest-first (lightweight-charts
+	// requires ascending time).
+	out := make([]OHLCRow, 0, limit)
+	for rows.Next() {
+		var r OHLCRow
+		if err := rows.Scan(&r.Ts, &r.Open, &r.High, &r.Low, &r.Close, &r.Count, &r.AvgConfidence); err != nil {
+			return nil, fmt.Errorf("clickhouse: history scan: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("clickhouse: history rows iter: %w", err)
+	}
+	// Reverse to ascending time.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
 // Close releases the underlying pool.
 func (c *ClickHouse) Close() error { return c.Conn.Close() }

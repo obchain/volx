@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -45,6 +46,36 @@ func OpenRedis(ctx context.Context, url string) (*Redis, error) {
 // still up" probe.
 func (r *Redis) Ping(ctx context.Context) error {
 	return r.Client.Ping(ctx).Err()
+}
+
+// ErrNotFound is returned from the `Get*` helpers below when the key
+// does not exist. The handlers in `internal/handlers` translate it
+// to HTTP 404 — they never expose `redis.Nil` directly.
+var ErrNotFound = errors.New("storage: key not found")
+
+// GetLatest reads `index:{ticker}:latest`. Engine (#20) writes this
+// key on every 60s tick; the value is the `IndexValue` JSON
+// envelope.
+func (r *Redis) GetLatest(ctx context.Context, ticker string) (string, error) {
+	return r.getKey(ctx, "index:"+ticker+":latest")
+}
+
+// GetLastStrip reads `index:{ticker}:last_strip`. Engine writes this
+// alongside `latest` (#23); the value is the dense-grid strip
+// envelope (`{index_id, ts, near, next}`).
+func (r *Redis) GetLastStrip(ctx context.Context, ticker string) (string, error) {
+	return r.getKey(ctx, "index:"+ticker+":last_strip")
+}
+
+func (r *Redis) getKey(ctx context.Context, key string) (string, error) {
+	v, err := r.Client.Get(ctx, key).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	return v, nil
 }
 
 // Close releases the underlying pool.
