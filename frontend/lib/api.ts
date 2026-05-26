@@ -75,7 +75,7 @@ export async function fetchLatest(id: IndexId): Promise<LatestResponse> {
 
 export async function fetchHistory(
   id: IndexId,
-  interval: "5m" | "1h" | "1d",
+  interval: "1m" | "5m" | "1h" | "1d",
   limit: number,
 ): Promise<HistoryResponse> {
   const url = `/v1/index/${id}/history?interval=${interval}&limit=${limit}`;
