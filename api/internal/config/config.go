@@ -36,6 +36,11 @@ type Config struct {
 	// the most recent `index_ticks` row is older than this. 90 s is
 	// 1.5 × the engine's 60 s recompute cadence.
 	HealthMaxAge time.Duration
+
+	// WSMaxConnsPerIP caps per-IP active WS connections. PRD §6
+	// pins the anon limit at 5; paid-tier auth (#M3) will skip
+	// this limiter for authenticated keys.
+	WSMaxConnsPerIP int
 }
 
 // Load reads every env var, applying defaults that match
@@ -43,12 +48,20 @@ type Config struct {
 // unparseable.
 func Load() (*Config, error) {
 	c := &Config{
-		BindAddr:      env("API_BIND", "127.0.0.1:8080"),
-		ClickHouseDSN: env("CLICKHOUSE_DSN", "clickhouse://default@127.0.0.1:9000?dial_timeout=2s"),
-		ClickHouseDB:  env("CLICKHOUSE_DB", "volx"),
-		RedisURL:      env("REDIS_URL", "redis://127.0.0.1:6379"),
-		Version:       env("VOLX_VERSION", "0.1.0"),
-		HealthMaxAge:  90 * time.Second,
+		BindAddr:        env("API_BIND", "127.0.0.1:8080"),
+		ClickHouseDSN:   env("CLICKHOUSE_DSN", "clickhouse://default@127.0.0.1:9000?dial_timeout=2s"),
+		ClickHouseDB:    env("CLICKHOUSE_DB", "volx"),
+		RedisURL:        env("REDIS_URL", "redis://127.0.0.1:6379"),
+		Version:         env("VOLX_VERSION", "0.1.0"),
+		HealthMaxAge:    90 * time.Second,
+		WSMaxConnsPerIP: 5,
+	}
+	if raw := os.Getenv("WS_MAX_CONNS_PER_IP"); raw != "" {
+		var n int
+		if _, err := fmt.Sscanf(raw, "%d", &n); err != nil {
+			return nil, fmt.Errorf("WS_MAX_CONNS_PER_IP=%q: %w", raw, err)
+		}
+		c.WSMaxConnsPerIP = n
 	}
 	if raw := os.Getenv("HEALTH_MAX_AGE_SECS"); raw != "" {
 		var secs int
