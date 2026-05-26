@@ -34,7 +34,7 @@ pub mod variance;
 
 pub use interpolate::{ExpiryVariance, InterpError, bvol, interpolate_30d};
 pub use sinks::{IndexSinks, SinkError};
-pub use snapshot::{SnapshotError, run_snapshot};
+pub use snapshot::{SnapshotError, SnapshotResult, run_snapshot};
 pub use strip::{
     BuildError, ChainLeg, DENSE_GRID_POINTS, ExpiryChain, build_strip, build_strip_with_rate,
 };

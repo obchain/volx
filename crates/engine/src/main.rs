@@ -115,8 +115,8 @@ async fn run_tick(reader: &ChClient, sinks: &mut IndexSinks, now: OffsetDateTime
     for index in [IndexId::Bvol, IndexId::Evol] {
         let ticker = index.ticker();
         match snapshot::run_snapshot(&chains, index, now) {
-            Ok(iv) => {
-                if let Err(e) = sinks.publish(&iv).await {
+            Ok(res) => {
+                if let Err(e) = sinks.publish(&res.value, &res.near, &res.next).await {
                     error!(index_id = ticker, error = %e, "publish failed");
                     metrics::counter!(
                         "volx_engine_publish_errors_total",
@@ -126,8 +126,8 @@ async fn run_tick(reader: &ChClient, sinks: &mut IndexSinks, now: OffsetDateTime
                 } else {
                     info!(
                         index_id = ticker,
-                        value = iv.value,
-                        confidence = iv.confidence,
+                        value = res.value.value,
+                        confidence = res.value.confidence,
                         "snapshot published"
                     );
                 }

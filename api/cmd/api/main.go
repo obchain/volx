@@ -103,6 +103,10 @@ func main() {
 		Version:    cfg.Version,
 		MaxAge:     cfg.HealthMaxAge,
 	}))
+	indexDeps := handlers.IndexDeps{Clickhouse: ch, Redis: rds}
+	v1.Get("/index/:id/latest", handlers.IndexLatest(indexDeps))
+	v1.Get("/index/:id/history", handlers.IndexHistory(indexDeps))
+	v1.Get("/options/strip", handlers.OptionsStrip(indexDeps))
 
 	// Run the listener in its own goroutine so `main` can wait on
 	// signal + shutdown sequentially.

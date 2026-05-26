@@ -16,9 +16,11 @@
 use ::redis::{AsyncCommands, Client as RedisClient, aio::MultiplexedConnection};
 use clickhouse::Client as ChClient;
 use serde::Serialize;
+use serde_json::json;
 use time::OffsetDateTime;
 use tracing::warn;
 use volx_shared_types::index::IndexValue;
+use volx_shared_types::strip::Strip;
 
 /// `volx.index_ticks` row mirror. Field order + names must match the
 /// `CREATE TABLE` in `docker/clickhouse-init.sql`; `clickhouse::Row`
@@ -88,13 +90,24 @@ impl IndexSinks {
 
     /// Insert one row into `index_ticks` and fan out to Redis.
     ///
+    /// In addition to the `latest` SET + `stream` PUBLISH from #20,
+    /// this also writes `index:{id}:last_strip` — a JSON envelope of
+    /// the near + next dense-grid strips used to compute the value.
+    /// Consumed by the API's `/v1/options/strip` transparency
+    /// endpoint (#23).
+    ///
     /// # Errors
     ///
     /// Returns the `ClickHouse` error if the durable insert fails.
     /// Redis publish / SET errors are logged + counter-emitted but do
     /// **not** surface here — the system of record is `index_ticks`,
     /// and the Redis surfaces are best-effort live caches.
-    pub async fn publish(&mut self, iv: &IndexValue) -> Result<(), SinkError> {
+    pub async fn publish(
+        &mut self,
+        iv: &IndexValue,
+        near: &Strip,
+        next: &Strip,
+    ) -> Result<(), SinkError> {
         let ticker = iv.index_id.ticker();
         let row = IndexRow {
             index_id: ticker,
@@ -117,14 +130,16 @@ impl IndexSinks {
         )
         .increment(1);
 
-        // 2. Redis SET + PUBLISH. Best-effort; on error increment a
-        //    counter and continue. Encoding matches the per-tick
-        //    options pubsub envelope from the normalizer: compact JSON
-        //    with RFC 3339 timestamps + hex strip_hash.
+        // 2. Redis SET + PUBLISH for `latest` + `stream`. Best-effort;
+        //    on error increment a counter and continue. Encoding
+        //    matches the per-tick options pubsub envelope from the
+        //    normalizer: compact JSON with RFC 3339 timestamps + hex
+        //    strip_hash.
         let payload = serde_json::to_string(iv)?;
 
         let latest_key = format!("index:{ticker}:latest");
         let stream_topic = format!("index:{ticker}:stream");
+        let strip_key = format!("index:{ticker}:last_strip");
 
         if let Err(e) = self.redis.set::<_, _, ()>(&latest_key, &payload).await {
             warn!(error = %e, key = %latest_key, "redis SET failed");
@@ -133,6 +148,33 @@ impl IndexSinks {
                 "op" => "set",
             )
             .increment(1);
+        }
+
+        // 3. Strip envelope for the `/v1/options/strip` endpoint.
+        //    Dense grid is 801 points × 2 strips = ~150 KB JSON; we
+        //    overwrite the key every 60s and consumers are
+        //    expected to fetch on demand, not subscribe — the size
+        //    is fine at the engine's publish cadence.
+        let strip_payload = strip_envelope(iv, near, next);
+        match serde_json::to_string(&strip_payload) {
+            Ok(s) => {
+                if let Err(e) = self.redis.set::<_, _, ()>(&strip_key, &s).await {
+                    warn!(error = %e, key = %strip_key, "redis SET last_strip failed");
+                    metrics::counter!(
+                        "volx_engine_redis_errors_total",
+                        "op" => "set_strip",
+                    )
+                    .increment(1);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "strip envelope encode failed");
+                metrics::counter!(
+                    "volx_engine_redis_errors_total",
+                    "op" => "encode_strip",
+                )
+                .increment(1);
+            }
         }
 
         if let Err(e) = self
@@ -156,4 +198,34 @@ impl IndexSinks {
 
         Ok(())
     }
+}
+
+/// Build the `index:{id}:last_strip` JSON envelope. Field shape is
+/// the public-API contract for `/v1/options/strip` (#23) — pinning
+/// it inline keeps a refactor of `Strip` field names from silently
+/// breaking the wire format.
+fn strip_envelope(iv: &IndexValue, near: &Strip, next: &Strip) -> serde_json::Value {
+    json!({
+        "index_id": iv.index_id.ticker(),
+        "ts":       iv.ts,
+        "near":     leg_envelope(near),
+        "next":     leg_envelope(next),
+    })
+}
+
+fn leg_envelope(s: &Strip) -> serde_json::Value {
+    // Map every dense-grid point to a compact tuple form. JSON
+    // arrays of arrays serialize ~30 % smaller than arrays of
+    // objects at 801 points (no key repetition).
+    let quotes: Vec<[f64; 3]> = s.quotes.iter().map(|q| [q.strike, q.q_usd, q.iv]).collect();
+    json!({
+        "forward":          s.forward,
+        "k_zero":           s.k_zero,
+        "time_to_expiry_y": s.time_to_expiry.0,
+        // `quotes` is a `[K, Q(K), iv]` triple per dense-grid point.
+        // The triple ordering is pinned in this comment because the
+        // public-API consumers (the methodology page, third-party
+        // verifiers) cannot read the type definition.
+        "quotes":           quotes,
+    })
 }

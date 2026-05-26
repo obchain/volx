@@ -87,13 +87,25 @@ impl SnapshotError {
     }
 }
 
+/// Full pipeline result: the published [`IndexValue`] plus the two
+/// `Strip`s that produced it. The strips travel to the scheduler so
+/// it can persist them to the Redis `index:{id}:last_strip` key for
+/// the `/v1/options/strip` transparency endpoint (#23).
+#[derive(Debug)]
+pub struct SnapshotResult {
+    pub value: IndexValue,
+    pub near: Strip,
+    pub next: Strip,
+}
+
 /// Run the full pipeline for one index. Returns the published
-/// [`IndexValue`] on success.
+/// [`IndexValue`] plus the near + next strips (for downstream
+/// persistence).
 pub fn run_snapshot(
     chains: &AssetChains,
     index: IndexId,
     now: OffsetDateTime,
-) -> Result<IndexValue, SnapshotError> {
+) -> Result<SnapshotResult, SnapshotError> {
     let asset = index.asset();
     let per_asset = chains
         .get(&asset)
@@ -127,12 +139,16 @@ pub fn run_snapshot(
         "snapshot computed"
     );
 
-    Ok(IndexValue {
-        index_id: index,
-        value: bvol_value,
-        confidence,
-        strip_hash,
-        ts: now,
+    Ok(SnapshotResult {
+        value: IndexValue {
+            index_id: index,
+            value: bvol_value,
+            confidence,
+            strip_hash,
+            ts: now,
+        },
+        near: near_strip,
+        next: next_strip,
     })
 }
 
@@ -292,16 +308,19 @@ mod tests {
         let next_t = 60.0 / 365.0; // 60 days
         let chains = build_chains_for_btc(near_t, next_t, 0.5);
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
-        let iv_row = run_snapshot(&chains, IndexId::Bvol, now).unwrap();
-        assert_eq!(iv_row.index_id, IndexId::Bvol);
+        let res = run_snapshot(&chains, IndexId::Bvol, now).unwrap();
+        assert_eq!(res.value.index_id, IndexId::Bvol);
         // Tolerance is loose (5 vol points) because the synthetic
         // chain's wing truncation feeds into both σ² components.
         assert!(
-            (iv_row.value - 50.0).abs() < 5.0,
+            (res.value.value - 50.0).abs() < 5.0,
             "BVOL={} (expected ≈ 50)",
-            iv_row.value
+            res.value.value
         );
-        assert!(iv_row.confidence >= 0.0 && iv_row.confidence <= 1.0);
+        assert!(res.value.confidence >= 0.0 && res.value.confidence <= 1.0);
+        // Strips travel out for the #23 strip-persist path.
+        assert_eq!(res.near.quotes.len(), crate::DENSE_GRID_POINTS);
+        assert_eq!(res.next.quotes.len(), crate::DENSE_GRID_POINTS);
     }
 
     #[test]
@@ -385,7 +404,7 @@ mod tests {
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
         let a = run_snapshot(&chains, IndexId::Bvol, now).unwrap();
         let b = run_snapshot(&chains, IndexId::Bvol, now).unwrap();
-        assert_eq!(a.strip_hash, b.strip_hash);
+        assert_eq!(a.value.strip_hash, b.value.strip_hash);
     }
 
     #[test]
@@ -395,7 +414,7 @@ mod tests {
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
         let a = run_snapshot(&chains_lo, IndexId::Bvol, now).unwrap();
         let b = run_snapshot(&chains_hi, IndexId::Bvol, now).unwrap();
-        assert_ne!(a.strip_hash, b.strip_hash);
+        assert_ne!(a.value.strip_hash, b.value.strip_hash);
     }
 
     /// Lock the wire-format `reason` labels — dashboards key on them.
