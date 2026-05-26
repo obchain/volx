@@ -48,6 +48,12 @@ rand               = { version = "0.9" }
 # exporter (#11) wires in via `metrics-exporter-prometheus` against this
 # same facade so emit sites do not change.
 metrics            = { version = "0.24" }
+# Prometheus HTTP exporter (#11). `http-listener` brings a hyper server
+# that serves `/metrics`; we deliberately drop the default
+# `push-gateway` feature because it pulls in `hyper-rustls/aws-lc-rs`
+# (TLS for outbound push) which we don't need for the
+# scrape-by-Prometheus model.
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 # TOML config for the normalizer (#12) and later venue / engine modules.
 toml               = { version = "0.8", default-features = false, features = ["parse"] }
 # ClickHouse client for the persistence sink (#16). `inserter` exposes the
