@@ -269,6 +269,36 @@ Acceptance bar for engine correctness (M1):
 `σ²_30d`** — roughly one part per million in published BVOL. Enforced by
 `cargo test -p volx-engine` against snapshot fixtures.
 
+### End-to-end smoke
+
+`scripts/e2e-smoke.sh` boots every M1 service in dependency order, waits
+two engine snapshots, and asserts that fresh data has reached the API
+surface. The M1 close gate (issue #66).
+
+```bash
+./scripts/e2e-smoke.sh
+```
+
+Requirements on `PATH`: `docker`, `cargo`, `go`, `curl`, `python3` with
+the `websockets` package (`pip install websockets`).
+
+Asserts, in order:
+
+1. `options_ticks` has ≥ 1 fresh row in the last 60 s (ingestion +
+   normalizer reaching ClickHouse).
+2. `index_ticks` has ≥ 1 fresh row in the last 120 s (engine writing).
+3. `GET /v1/index/bvol/latest` returns 200 with `value > 0` and
+   `age < 90 s`.
+4. `GET /v1/index/bvol/history?interval=5m&limit=12` returns 200 with
+   `bars ≥ 1`.
+5. `ws://…/v1/stream` delivers at least one `type:tick` frame for both
+   `bvol` and `evol` inside a 75 s window (via
+   `scripts/e2e-ws-client.py`).
+
+Exits 0 on success with a stage-timing summary; non-zero with the name
+of the failed assertion. Compose teardown runs in the exit trap so the
+script is idempotent across repeated runs.
+
 ---
 
 ## Repo layout
