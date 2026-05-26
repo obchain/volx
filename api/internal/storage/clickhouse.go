@@ -8,11 +8,20 @@ package storage
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
+
+// validDBName is the allowlist for `CLICKHOUSE_DB`. Database / table
+// identifiers can't be parameter-bound in `clickhouse-go/v2`, so we
+// validate them once at startup rather than interpolating untrusted
+// strings into every query. Pinned to letters / digits / underscores
+// — ClickHouse's actual identifier grammar is wider but no real
+// schema needs anything else.
+var validDBName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // ClickHouse is the API's read-only handle to the engine's published
 // rows. Writes never originate here — the engine binary is the only
@@ -27,15 +36,21 @@ type ClickHouse struct {
 // to start against a broken backend (matches the Rust crates'
 // fail-fast posture from #16 / #20).
 func OpenClickHouse(ctx context.Context, dsn, db string) (*ClickHouse, error) {
+	if !validDBName.MatchString(db) {
+		return nil, fmt.Errorf("clickhouse: invalid CLICKHOUSE_DB %q (must match %s)", db, validDBName)
+	}
 	opts, err := clickhouse.ParseDSN(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("clickhouse: parse dsn: %w", err)
 	}
-	// Force the database in case the DSN omits it; the binary always
-	// operates against one logical DB.
-	if opts.Auth.Database == "" {
-		opts.Auth.Database = db
-	}
+	// `CLICKHOUSE_DB` is the source of truth — always override the
+	// DSN's `database` field. Without this, a DSN that carried its
+	// own DB would cause a split-brain: the connection dialled
+	// against the DSN's DB, but our queries (built from `c.DB`)
+	// would target the env's DB instead. Match-or-error would also
+	// work; overriding is simpler and matches the env-wins precedence
+	// the rest of the binary uses.
+	opts.Auth.Database = db
 	// Read-only connection pool sizing. The API's hot path is one
 	// query per request; a 10-conn pool absorbs bursts without
 	// hammering the server.
@@ -64,14 +79,17 @@ func OpenClickHouse(ctx context.Context, dsn, db string) (*ClickHouse, error) {
 // `degraded`.
 //
 // Returns `(0, nil)` if the table is empty (e.g., first boot before
-// the engine has run a tick).
+// the engine has run a tick). The clickhouse-go driver maps a NULL
+// `max(ts)` to Unix epoch zero (1970-01-01), not Go's
+// `time.Time{}`, so the empty-table guard checks `Unix() <= 0`
+// rather than `IsZero()`.
 func (c *ClickHouse) LastIndexTickAge(ctx context.Context) (time.Duration, error) {
 	var maxTs time.Time
 	q := fmt.Sprintf("SELECT max(ts) FROM %s.index_ticks", c.DB)
 	if err := c.Conn.QueryRow(ctx, q).Scan(&maxTs); err != nil {
 		return 0, fmt.Errorf("clickhouse: last index tick: %w", err)
 	}
-	if maxTs.IsZero() {
+	if maxTs.IsZero() || maxTs.Unix() <= 0 {
 		return 0, nil
 	}
 	return time.Since(maxTs), nil
