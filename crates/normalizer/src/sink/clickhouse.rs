@@ -37,8 +37,6 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use volx_shared_types::OptionTick;
 
-use super::{asset_label, kind_label, venue_label};
-
 /// Default bounded-queue size for the producer → worker channel. Sized
 /// roughly 2× the per-flush `max_rows` so a short worker stall (one
 /// in-flight insert plus a fresh batch's worth of rows) doesn't trip the
@@ -233,11 +231,11 @@ struct OptionTickRow {
 impl From<&OptionTick> for OptionTickRow {
     fn from(t: &OptionTick) -> Self {
         Self {
-            venue: venue_label(t.venue).to_owned(),
-            asset: asset_label(t.asset).to_owned(),
+            venue: t.venue.label().to_owned(),
+            asset: t.asset.label().to_owned(),
             expiry: t.expiry,
             strike: t.strike,
-            kind: kind_label(t.kind).to_owned(),
+            kind: t.kind.label().to_owned(),
             bid: t.bid,
             ask: t.ask,
             mid: t.mid,

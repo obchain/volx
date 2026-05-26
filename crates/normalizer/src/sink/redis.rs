@@ -30,8 +30,6 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use volx_shared_types::OptionTick;
 
-use super::{asset_label, kind_label, venue_label};
-
 /// Default depth of the producer → worker queue. One tick is ~250 B
 /// post-serialization; this caps the in-process buffer near 1 MB. Larger
 /// caps just defer the drop-oldest decision under sustained Redis
@@ -156,11 +154,7 @@ async fn run_worker(
     mut rx: mpsc::Receiver<OptionTick>,
 ) {
     while let Some(tick) = rx.recv().await {
-        let topic = format!(
-            "options:{}:{}",
-            venue_label(tick.venue),
-            asset_label(tick.asset)
-        );
+        let topic = format!("options:{}:{}", tick.venue.label(), tick.asset.label());
         // Compact JSON; the wire format mirrors the in-process struct so
         // dashboards parsing this don't need a separate schema. Using
         // `serde_json::to_string` over the tick directly keeps the kind /
@@ -182,8 +176,8 @@ async fn run_worker(
             Ok(()) => {
                 metrics::counter!(
                     "volx_normalizer_redis_published_total",
-                    "venue" => venue_label(tick.venue),
-                    "asset" => asset_label(tick.asset),
+                    "venue" => tick.venue.label(),
+                    "asset" => tick.asset.label(),
                 )
                 .increment(1);
             }
@@ -269,11 +263,11 @@ fn tick_to_json(t: &OptionTick) -> Result<String, serde_json::Error> {
     // ingest-time won't be a breaking topic-payload change for the
     // `/v1/stream` (#24) consumers.
     let payload = json!({
-        "venue":          venue_label(t.venue),
-        "asset":          asset_label(t.asset),
+        "venue":          t.venue.label(),
+        "asset":          t.asset.label(),
         "expiry":         expiry,
         "strike":         t.strike,
-        "kind":           kind_label(t.kind),
+        "kind":           t.kind.label(),
         "bid":            t.bid,
         "ask":            t.ask,
         "mid":            t.mid,
