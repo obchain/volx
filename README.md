@@ -284,11 +284,11 @@ the `websockets` package (`pip install websockets`).
 
 Asserts, in order:
 
-1. `options_ticks` has ≥ 1 fresh row in the last 60 s (ingestion +
+1. `options_ticks` has ≥ 1 fresh row in the last 1 minute (ingestion +
    normalizer reaching ClickHouse).
-2. `index_ticks` has ≥ 1 fresh row in the last 120 s (engine writing).
+2. `index_ticks` has ≥ 1 fresh row in the last 2 minutes (engine writing).
 3. `GET /v1/index/bvol/latest` returns 200 with `value > 0` and
-   `age < 90 s`.
+   `age < 150 s` (two engine cycles + slack).
 4. `GET /v1/index/bvol/history?interval=5m&limit=12` returns 200 with
    `bars ≥ 1`.
 5. `ws://…/v1/stream` delivers at least one `type:tick` frame for both
