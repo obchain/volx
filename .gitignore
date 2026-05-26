@@ -5,6 +5,7 @@ Cargo.lock
 
 # Go
 /api/bin/
+/api/api-bin
 *.exe
 *.test
 *.out
