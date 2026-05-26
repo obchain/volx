@@ -48,7 +48,7 @@ export function Sparkline({ values, width = 240, height = 56, className }: Spark
     >
       <polyline
         fill="none"
-        stroke={up ? "rgb(74, 222, 128)" : "rgb(248, 113, 113)"}
+        stroke={up ? "var(--up)" : "var(--down)"}
         strokeWidth={STROKE}
         points={points}
       />
