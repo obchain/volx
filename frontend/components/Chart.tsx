@@ -161,6 +161,9 @@ export function Chart({ id }: ChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
   const barsRef = useRef<HistoryBar[]>([]);
+  // Held outside React state so the periodic history fetch can re-apply
+  // the freshest tick after replacing `barsRef.current`.
+  const latestTickRef = useRef<{ value: number; ts: number } | null>(null);
   const [timeframe, setTimeframe] = useState<Timeframe>(DEFAULT_TIMEFRAME);
   const [stats, setStats] = useState<Stats | null>(null);
   const [loadErr, setLoadErr] = useState<string | null>(null);
@@ -422,6 +425,33 @@ export function Chart({ id }: ChartProps) {
     [id, theme],
   );
 
+  // `draw` is captured in a ref so the long-lived interval effect below can
+  // read the latest function without taking `draw` as a dependency. Without
+  // this, a `theme` flip recreates `draw`, which would cancel the interval
+  // and trigger a redundant history refetch on every toggle.
+  const drawRef = useRef(draw);
+  useEffect(() => {
+    drawRef.current = draw;
+  }, [draw]);
+
+  // Re-applies the latest WS tick to the last bar in `barsRef`. Used after
+  // a history refetch overwrites the bar set — if the tick is fresher than
+  // the server-side last bar, patch it back so the painted candle keeps
+  // up.
+  const applyLatestTickToLastBar = () => {
+    const tick = latestTickRef.current;
+    if (!tick || barsRef.current.length === 0) return;
+    const last = barsRef.current[barsRef.current.length - 1]!;
+    const lastBarMs = Date.parse(last.ts);
+    if (Number.isNaN(lastBarMs) || tick.ts < lastBarMs) return;
+    barsRef.current[barsRef.current.length - 1] = {
+      ...last,
+      high: Math.max(last.high, tick.value),
+      low: Math.min(last.low, tick.value),
+      close: tick.value,
+    };
+  };
+
   useEffect(() => {
     let cancelled = false;
     const spec = TIMEFRAME_SPEC[timeframe];
@@ -431,8 +461,9 @@ export function Chart({ id }: ChartProps) {
         const hist = await fetchHistory(id, spec.interval, spec.limit);
         if (cancelled) return;
         barsRef.current = hist.bars;
-        setStats(computeStats(hist.bars));
-        draw(hist.bars);
+        applyLatestTickToLastBar();
+        setStats(computeStats(barsRef.current));
+        drawRef.current(barsRef.current);
       } catch (e) {
         if (!cancelled) setLoadErr(e instanceof Error ? e.message : String(e));
       }
@@ -443,28 +474,30 @@ export function Chart({ id }: ChartProps) {
       cancelled = true;
       window.clearInterval(handle);
     };
-  }, [id, timeframe, draw]);
+  }, [id, timeframe]);
 
-  // Redraw when theme flips so ECharts picks up the new CSS-var values.
+  // Redraw when theme flips so ECharts picks up the new palette.
   useEffect(() => {
-    if (barsRef.current.length > 0) draw(barsRef.current);
-  }, [theme, draw]);
+    if (barsRef.current.length > 0) drawRef.current(barsRef.current);
+  }, [theme]);
 
-  // Live tick → patch last candle in place.
+  // Live tick → patch last candle in place + redraw via `drawRef` so every
+  // close-dependent series (line area, EMA overlay, mark-line) stays in
+  // sync with the candle. Targeting one series by index would silently
+  // overwrite the wrong layer because partial-option series merge by
+  // position, not by id, unless every series carries an explicit id.
   useEffect(() => {
     if (!liveTick || !chartRef.current || barsRef.current.length === 0) return;
+    latestTickRef.current = { value: liveTick.value, ts: liveTick.ts };
     const last = barsRef.current[barsRef.current.length - 1]!;
-    const newLast: HistoryBar = {
+    barsRef.current[barsRef.current.length - 1] = {
       ...last,
       high: Math.max(last.high, liveTick.value),
       low: Math.min(last.low, liveTick.value),
       close: liveTick.value,
     };
-    barsRef.current[barsRef.current.length - 1] = newLast;
     setStats(computeStats(barsRef.current));
-    chartRef.current.setOption({
-      series: [{ data: barsRef.current.map((b) => [b.open, b.close, b.low, b.high]) }],
-    });
+    drawRef.current(barsRef.current);
   }, [liveTick]);
 
   const value = liveTick?.value ?? stats?.close;
