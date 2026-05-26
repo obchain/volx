@@ -19,10 +19,17 @@ export function Sparkline({ values, width = 240, height = 56, className }: Spark
   const range = max - min || 1;
   const step = width / (values.length - 1);
 
+  // Inset by half the stroke so the polyline at v=min and v=max
+  // does not get clipped by the SVG edge (1.5 px stroke renders
+  // half outside the viewbox at y=0 / y=height otherwise).
+  const STROKE = 1.5;
+  const top = STROKE / 2;
+  const drawH = height - STROKE;
+
   const points = values
     .map((v, i) => {
       const x = i * step;
-      const y = height - ((v - min) / range) * height;
+      const y = top + drawH - ((v - min) / range) * drawH;
       return `${x.toFixed(2)},${y.toFixed(2)}`;
     })
     .join(" ");
@@ -42,7 +49,7 @@ export function Sparkline({ values, width = 240, height = 56, className }: Spark
       <polyline
         fill="none"
         stroke={up ? "rgb(74, 222, 128)" : "rgb(248, 113, 113)"}
-        strokeWidth={1.5}
+        strokeWidth={STROKE}
         points={points}
       />
     </svg>

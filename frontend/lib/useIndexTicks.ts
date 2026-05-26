@@ -69,8 +69,8 @@ export function useIndexTicks(channels: IndexId[]) {
       };
 
       ws.onclose = () => {
-        setState("closed");
         if (stopped) return;
+        setState("closed");
         backoff = Math.min(backoff * 2, 15_000);
         reconnectTimer = setTimeout(connect, backoff);
       };

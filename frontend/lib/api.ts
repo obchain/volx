@@ -1,20 +1,23 @@
 // Shared API contracts + HTTP base. Mirrors the Go API wire shapes in
 // `api/internal/handlers/index.go` (REST envelopes) and
 // `api/internal/stream/hub.go` (WS frame shape).
+//
+// Two surfaces, two transport stories:
+//
+// - REST always uses a same-origin relative path (`/v1/...`). The Next
+//   dev/prod server rewrites that to the Go API target — see
+//   `next.config.ts` (`API_PROXY_TARGET`, default `http://localhost:8080`).
+//   No CORS plumbing needed.
+//
+// - WebSocket cannot ride the rewrite (the upgrade handshake bypasses
+//   the rewrite layer) and connects directly. The host is configurable
+//   via `NEXT_PUBLIC_API_BASE`, default `http://localhost:8080`. If the
+//   API is reachable on a non-default host, both `API_PROXY_TARGET`
+//   (build-time, server) and `NEXT_PUBLIC_API_BASE` (build-time, public)
+//   must point at it.
+const WS_API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8080";
 
-// REST goes through the Next.js rewrite proxy (see next.config.ts) so
-// it stays same-origin without API-side CORS. WS bypasses the proxy
-// (rewrites do not handle the upgrade) and connects directly. Override
-// with `NEXT_PUBLIC_API_BASE` if the API is on a different host than
-// localhost:8080.
-const PUBLIC_API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8080";
-
-export const API_BASE = "";
-
-export const WS_URL = (() => {
-  const base = PUBLIC_API_BASE.replace(/^http/, "ws");
-  return `${base}/v1/stream`;
-})();
+export const WS_URL = `${WS_API_BASE.replace(/^http/, "ws")}/v1/stream`;
 
 export type IndexId = "bvol" | "evol";
 
@@ -65,9 +68,7 @@ export interface ErrorFrame {
 export type WsFrame = TickFrame | ErrorFrame;
 
 export async function fetchLatest(id: IndexId): Promise<LatestResponse> {
-  const r = await fetch(`${API_BASE}/v1/index/${id}/latest`, {
-    cache: "no-store",
-  });
+  const r = await fetch(`/v1/index/${id}/latest`, { cache: "no-store" });
   if (!r.ok) throw new Error(`latest ${id}: ${r.status}`);
   return (await r.json()) as LatestResponse;
 }
@@ -77,7 +78,7 @@ export async function fetchHistory(
   interval: "5m" | "1h" | "1d",
   limit: number,
 ): Promise<HistoryResponse> {
-  const url = `${API_BASE}/v1/index/${id}/history?interval=${interval}&limit=${limit}`;
+  const url = `/v1/index/${id}/history?interval=${interval}&limit=${limit}`;
   const r = await fetch(url, { cache: "no-store" });
   if (!r.ok) throw new Error(`history ${id}: ${r.status}`);
   return (await r.json()) as HistoryResponse;
