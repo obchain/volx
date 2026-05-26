@@ -163,15 +163,16 @@ func (c *Conn) writeLoop() {
 	defer ticker.Stop()
 	defer c.close()
 
+	// Note on exit paths: `c.send` is never explicitly closed —
+	// `Conn` is GC'd with its channel once both goroutines exit.
+	// The two real exits below are `c.closed` (peer drop / hub
+	// shutdown) and a write error (deadline exceeded, peer reset).
 	for {
 		select {
 		case <-c.closed:
 			return
-		case frame, ok := <-c.send:
-			if !ok {
-				return
-			}
-			_ = c.ws.SetWriteDeadline(time.Now().Add(PongTimeout))
+		case frame := <-c.send:
+			_ = c.ws.SetWriteDeadline(time.Now().Add(WriteTimeout))
 			if err := c.ws.WriteMessage(websocket.TextMessage, frame); err != nil {
 				return
 			}

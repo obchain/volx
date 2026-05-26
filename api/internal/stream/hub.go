@@ -62,6 +62,12 @@ const PingInterval = 30 * time.Second
 // PongTimeout is how long after a ping we wait for the pong.
 const PongTimeout = 10 * time.Second
 
+// WriteTimeout caps how long a single data-frame write can block
+// before we declare the WS connection dead. Distinct from
+// `PongTimeout` so the keepalive cadence + per-frame stall budget
+// can be tuned independently.
+const WriteTimeout = 10 * time.Second
+
 // EngineTick is the JSON envelope the engine writes to Redis. Same
 // shape as `handlers.engineIndexValue` but kept independent because
 // the two are wired-time contracts that may diverge in future (e.g.
