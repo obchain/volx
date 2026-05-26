@@ -37,9 +37,18 @@ API_HOST="${API_HOST:-localhost}"
 API_PORT="${API_PORT:-8080}"
 API_BASE="http://${API_HOST}:${API_PORT}"
 
-# Two engine snapshots + safety margin: 60 + 60 + 15.
-ENGINE_WAIT_S="${ENGINE_WAIT_S:-135}"
+# Two engine snapshots + cold-start safety margin. Deribit instrument
+# enumeration on first connect can take 30-60 s, which pushes snapshot
+# #1 to t=60-90 and snapshot #2 to t=120-150. 240 s leaves room for a
+# slow first connect on top of the two-cycle wait. Override with the
+# env var to tune on faster hardware / warm caches.
+ENGINE_WAIT_S="${ENGINE_WAIT_S:-240}"
 WS_TIMEOUT_S="${WS_TIMEOUT_S:-75}"
+# Preserve clickhouse + redis volumes across runs. Off by default — the
+# smoke wipes data so stale `index_ticks` rows from prior sessions can
+# not silently satisfy "fresh row" assertions. Set to "1" to skip the
+# wipe when iterating on the script without losing local history.
+PRESERVE_VOLUMES="${PRESERVE_VOLUMES:-0}"
 
 # Prefer the research venv (already has `websockets` from M0 work);
 # fall back to system python3 otherwise. Override via env if needed.
@@ -150,9 +159,17 @@ API_BIN="${ROOT_DIR}/api/api-bin"
 # ------- stages --------------------------------------------------------------
 
 stage_begin "compose-up"
-# Wipe any existing volumes so stale ticks from a previous session don't
-# satisfy "fresh row" assertions before the new pipeline writes anything.
-docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" down --volumes >/dev/null 2>&1 || true
+# DESTRUCTIVE by default: wipe ClickHouse + Redis volumes so stale
+# `index_ticks` rows from prior sessions can not satisfy "fresh row"
+# assertions before the new pipeline produces anything. Set
+# PRESERVE_VOLUMES=1 in the environment to keep data across runs (e.g.
+# while iterating on the script without losing a day's history).
+if [ "${PRESERVE_VOLUMES}" = "1" ]; then
+  echo "    PRESERVE_VOLUMES=1 — keeping clickhouse + redis data" >&2
+  docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" down >/dev/null 2>&1 || true
+else
+  docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" down --volumes >/dev/null 2>&1 || true
+fi
 docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" up -d
 stage_end "compose-up"
 
@@ -225,7 +242,11 @@ print(int((now - dt).total_seconds()))
 echo "    /latest bvol value=${latest_value} age=${latest_age}s" >&2
 "${PYTHON_BIN}" -c "import sys; sys.exit(0 if float('${latest_value}') > 0 else 1)" \
   || fail "/latest value (${latest_value}) is not > 0"
-[ "${latest_age}" -lt 90 ] || fail "/latest age (${latest_age}s) ≥ 90s"
+# Engine publishes every 60 s; with the post-second-snapshot delay
+# burned by the ClickHouse assertions + curl latency, a healthy tick
+# can reach ~70-90 s of age before this line. 150 s = two cycles + a
+# safety margin so a brief engine stall doesn't false-fail the smoke.
+[ "${latest_age}" -lt 150 ] || fail "/latest age (${latest_age}s) ≥ 150s"
 stage_end "assert-rest-latest"
 
 stage_begin "assert-rest-history"
