@@ -32,26 +32,6 @@ use tracing::{debug, error, info, warn};
 
 use volx_shared_types::{Asset, OptionKind, OptionTick, Venue};
 
-/// Stable Prometheus label for [`Venue`]. Mirrors the lowercase
-/// `snake_case` wire form used elsewhere (normalizer Redis topics,
-/// `options_ticks.venue` column). Dashboards key on these — do not
-/// change without a wire-format bump.
-const fn venue_label(v: Venue) -> &'static str {
-    match v {
-        Venue::Deribit => "deribit",
-        Venue::Okx => "okx",
-        Venue::Bybit => "bybit",
-    }
-}
-
-/// Stable Prometheus label for [`Asset`]. Same stability contract.
-const fn asset_label(a: Asset) -> &'static str {
-    match a {
-        Asset::Btc => "btc",
-        Asset::Eth => "eth",
-    }
-}
-
 const WS_URL: &str = "wss://www.deribit.com/ws/api/v2";
 const REST_INSTRUMENTS: &str = "https://www.deribit.com/api/v2/public/get_instruments";
 
@@ -190,8 +170,8 @@ pub(crate) async fn connect_and_stream(
                 continue;
             }
         };
-        let venue_label = venue_label(tick.venue);
-        let asset_label = asset_label(tick.asset);
+        let venue_label = tick.venue.label();
+        let asset_label = tick.asset.label();
         if tx.send_async(tick).await.is_err() {
             info!("downstream channel closed; ingestion exiting");
             downstream_dropped = true;

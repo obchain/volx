@@ -132,26 +132,9 @@ pub async fn run_default_pipeline(
     Ok(())
 }
 
-/// Wire-side label for `Venue`. Matches both the `LowCardinality(String)`
-/// value written to `options_ticks.venue` and the Redis topic segment.
-pub(crate) fn venue_label(v: volx_shared_types::Venue) -> &'static str {
-    match v {
-        volx_shared_types::Venue::Deribit => "deribit",
-        volx_shared_types::Venue::Okx => "okx",
-        volx_shared_types::Venue::Bybit => "bybit",
-    }
-}
-
-pub(crate) fn asset_label(a: volx_shared_types::Asset) -> &'static str {
-    match a {
-        volx_shared_types::Asset::Btc => "btc",
-        volx_shared_types::Asset::Eth => "eth",
-    }
-}
-
-pub(crate) fn kind_label(k: volx_shared_types::OptionKind) -> &'static str {
-    match k {
-        volx_shared_types::OptionKind::Call => "call",
-        volx_shared_types::OptionKind::Put => "put",
-    }
-}
+// Wire-side label helpers were lifted to `volx_shared_types` — see
+// `Venue::label`, `Asset::label`, `OptionKind::label`. The
+// `ClickHouse` row encoders and the Redis topic builder now consume
+// those directly so the ingestion crate, the normalizer sinks, and
+// the engine all share one source of truth for the wire-format
+// label strings.
