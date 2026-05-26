@@ -1,0 +1,37 @@
+{
+  "name": "volx-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md,css}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md,css}\""
+  },
+  "dependencies": {
+    "next": "15.1.6",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "lightweight-charts": "4.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.7",
+    "@types/react": "19.0.7",
+    "@types/react-dom": "19.0.3",
+    "@tailwindcss/postcss": "4.0.17",
+    "tailwindcss": "4.0.17",
+    "postcss": "8.5.1",
+    "typescript": "5.7.3",
+    "eslint": "9.18.0",
+    "eslint-config-next": "15.1.6",
+    "@eslint/eslintrc": "3.2.0",
+    "prettier": "3.4.2"
+  }
+}
