@@ -4,13 +4,20 @@
 #
 # The 80 % coverage gate from #21 applies to engine *numerics* — strip
 # builder, variance integral, interpolation, BS pricer, spline, snapshot
-# orchestrator. The async I/O wrappers (`chain::fetch_chains`,
-# `sinks::IndexSinks::publish`) and the binary entrypoint
-# (`engine/src/main.rs`) are exercised by the end-to-end smoke
-# (`scripts/e2e-smoke.sh`, CI-gated). Counting them against the
-# unit-test coverage target encourages brittle mocked-client tests that
-# don't catch real-world regressions — drop them from the denominator
-# instead.
+# orchestrator, and the chain assembler.
+#
+# Two files are excluded from the denominator:
+#
+# - `engine/src/main.rs` — binary entry, exercised by `scripts/e2e-smoke.sh`
+# - `engine/src/sinks.rs` — `IndexSinks::publish` is async ClickHouse +
+#   Redis I/O. The pure helpers (`strip_envelope`, `leg_envelope`) are
+#   unit-tested; the I/O wrapping needs a real connection, exercised by
+#   the e2e smoke. The whole file is excluded for simplicity; the
+#   `tests` module inside still runs and counts toward the test count
+#   even though the file is omitted from coverage.
+#
+# `chain::fetch_chains` is *not* excluded — its async body is small and
+# its ~25 uncovered lines are visible in the per-file breakdown.
 #
 # Current numerics coverage: 86.5 % (351/406 lines, 2026-05-27).
 
@@ -19,7 +26,12 @@ packages = ["volx-engine"]
 exclude-files = [
     "crates/engine/src/main.rs",
     "crates/engine/src/sinks.rs",
+    # `packages = ["volx-engine"]` does NOT filter the coverage scan —
+    # any file reached through engine's dep graph (normalizer types,
+    # shared-types defs) gets counted unless excluded. Drop them too;
+    # those crates have their own coverage targets.
     "crates/normalizer/src/*",
+    "crates/normalizer/src/**/*",
     "crates/shared-types/src/*",
 ]
 timeout = "120s"

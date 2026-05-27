@@ -302,20 +302,21 @@ mod tests {
 
         assert_eq!(env["index_id"], "BVOL");
         // `ts` is currently serialized via `time::OffsetDateTime`'s default
-        // serializer (numeric array), not the IndexValue's `rfc3339` form
-        // — tracked as #73. The bug-fix PR flips this assertion to a
-        // proper string check.
-        assert!(!env["ts"].is_null(), "ts must be emitted in some form");
+        // serializer (numeric array), not the IndexValue's `rfc3339`
+        // string form — tracked as #73. Document the current broken
+        // shape explicitly so the bug-fix PR can flip
+        // `is_array()` → `is_string()` in one line.
+        assert!(
+            env["ts"].is_array() || env["ts"].is_string(),
+            "ts must be numeric-array (current bug #73) or RFC 3339 string (post-#73); got {:?}",
+            env["ts"]
+        );
 
         // Both legs present with leg_envelope shape inherited.
         assert_eq!(env["near"]["forward"], 100.0);
         assert_eq!(env["next"]["forward"], 100.0);
-        assert!(
-            (env["near"]["time_to_expiry_y"].as_f64().unwrap() - 7.0 / 365.0).abs() < 1e-12
-        );
-        assert!(
-            (env["next"]["time_to_expiry_y"].as_f64().unwrap() - 40.0 / 365.0).abs() < 1e-12
-        );
+        assert!((env["near"]["time_to_expiry_y"].as_f64().unwrap() - 7.0 / 365.0).abs() < 1e-12);
+        assert!((env["next"]["time_to_expiry_y"].as_f64().unwrap() - 40.0 / 365.0).abs() < 1e-12);
 
         // Near + next are distinct envelopes (no aliasing).
         assert_ne!(env["near"], env["next"]);
