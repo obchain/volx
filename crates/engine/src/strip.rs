@@ -541,6 +541,172 @@ mod tests {
     }
 
     #[test]
+    fn irregular_strike_spacing_still_builds() {
+        // Asymmetric / non-uniform listed strikes around F=100. The
+        // dense grid runs linearly between K_min and K_max regardless
+        // of the input spacing — the spline is what handles the
+        // irregularity. Build must succeed and the dense grid must
+        // still be monotonic.
+        let t = 0.25;
+        let iv = 0.5;
+        let strikes = [50.0, 70.0, 85.0, 95.0, 100.0, 105.0, 130.0, 200.0];
+        let legs = strikes
+            .iter()
+            .map(|&k| ChainLeg {
+                strike: k,
+                call_mid_usd: Some(call_price(100.0, k, t, 0.0, iv)),
+                put_mid_usd: Some(put_price(100.0, k, t, 0.0, iv)),
+                call_iv: Some(iv),
+                put_iv: Some(iv),
+            })
+            .collect();
+        let chain = ExpiryChain {
+            time_to_expiry: Years(t),
+            legs,
+        };
+        let strip = build_strip(&chain).unwrap();
+        assert_eq!(strip.quotes.len(), DENSE_GRID_POINTS);
+        for w in strip.quotes.windows(2) {
+            assert!(w[1].strike > w[0].strike);
+        }
+        // Forward should still recover near 100 — picker tie-breaks on
+        // smallest |C − P|, which is the K=100 ATM leg.
+        assert!((strip.forward - 100.0).abs() < 1e-9, "F={}", strip.forward);
+    }
+
+    #[test]
+    fn very_wide_strike_range_builds_with_dense_grid_spanning_full_range() {
+        // K spans an order of magnitude (10 → 1000) around F=100. Strip
+        // builder should still produce a 801-point grid covering the
+        // whole listed range.
+        let t = 0.25;
+        let iv = 0.5;
+        let strikes = [10.0, 30.0, 80.0, 100.0, 120.0, 300.0, 1000.0];
+        let legs = strikes
+            .iter()
+            .map(|&k| ChainLeg {
+                strike: k,
+                call_mid_usd: Some(call_price(100.0, k, t, 0.0, iv)),
+                put_mid_usd: Some(put_price(100.0, k, t, 0.0, iv)),
+                call_iv: Some(iv),
+                put_iv: Some(iv),
+            })
+            .collect();
+        let chain = ExpiryChain {
+            time_to_expiry: Years(t),
+            legs,
+        };
+        let strip = build_strip(&chain).unwrap();
+        assert_eq!(strip.quotes.len(), DENSE_GRID_POINTS);
+        assert!((strip.quotes.first().unwrap().strike - 10.0).abs() < 1e-9);
+        assert!((strip.quotes.last().unwrap().strike - 1000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn single_side_wings_still_build_via_iv_fallback() {
+        // Top of the grid has only call IVs (no put), bottom has only
+        // put IVs. As long as ≥ MIN_STRIP_QUOTES strikes carry a
+        // usable IV (call OR put) and at least one strike has both
+        // legs quoted for the forward picker, the build succeeds.
+        let t = 0.25;
+        let iv = 0.5;
+        let f = 100.0;
+        // ATM legs with both sides quoted — gives the forward picker.
+        let mut legs = vec![ChainLeg {
+            strike: f,
+            call_mid_usd: Some(call_price(f, f, t, 0.0, iv)),
+            put_mid_usd: Some(put_price(f, f, t, 0.0, iv)),
+            call_iv: Some(iv),
+            put_iv: Some(iv),
+        }];
+        // Lower wing — put-side only IV (call is gone).
+        for k in [80.0, 85.0, 90.0, 95.0] {
+            legs.push(ChainLeg {
+                strike: k,
+                call_mid_usd: None,
+                put_mid_usd: None,
+                call_iv: None,
+                put_iv: Some(iv),
+            });
+        }
+        // Upper wing — call-side only IV.
+        for k in [105.0, 110.0, 115.0, 120.0] {
+            legs.push(ChainLeg {
+                strike: k,
+                call_mid_usd: None,
+                put_mid_usd: None,
+                call_iv: Some(iv),
+                put_iv: None,
+            });
+        }
+        let chain = ExpiryChain {
+            time_to_expiry: Years(t),
+            legs,
+        };
+        let strip = build_strip(&chain).unwrap();
+        assert!((strip.forward - f).abs() < 1e-9);
+        assert_eq!(strip.quotes.len(), DENSE_GRID_POINTS);
+    }
+
+    #[test]
+    fn rejects_when_forward_is_outside_listed_strike_range() {
+        // Construct a chain where every strike sits well below the
+        // implied forward — picker yields F outside [K_min, K_max] →
+        // §4.3 step 3 rejects rather than extrapolating.
+        let t = 0.25;
+        let iv = 0.5;
+        // K's all below 50; the only two-sided leg pins F via a large
+        // C − P bias to push F above K_max.
+        let legs = vec![
+            ChainLeg {
+                strike: 10.0,
+                call_mid_usd: Some(60.0),
+                put_mid_usd: Some(1.0),
+                call_iv: Some(iv),
+                put_iv: Some(iv),
+            },
+            ChainLeg {
+                strike: 20.0,
+                call_mid_usd: None,
+                put_mid_usd: None,
+                call_iv: Some(iv),
+                put_iv: Some(iv),
+            },
+            ChainLeg {
+                strike: 30.0,
+                call_mid_usd: None,
+                put_mid_usd: None,
+                call_iv: Some(iv),
+                put_iv: Some(iv),
+            },
+            ChainLeg {
+                strike: 40.0,
+                call_mid_usd: None,
+                put_mid_usd: None,
+                call_iv: Some(iv),
+                put_iv: Some(iv),
+            },
+            ChainLeg {
+                strike: 50.0,
+                call_mid_usd: None,
+                put_mid_usd: None,
+                call_iv: Some(iv),
+                put_iv: Some(iv),
+            },
+        ];
+        let chain = ExpiryChain {
+            time_to_expiry: Years(t),
+            legs,
+        };
+        match build_strip(&chain) {
+            Err(BuildError::ForwardOutsideStrikeRange { forward, .. }) => {
+                assert!(forward > 50.0, "F={forward} should overshoot K_max=50");
+            }
+            other => panic!("expected ForwardOutsideStrikeRange, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn put_call_parity_holds_for_strip_split_point() {
         // At K = F, C − P = 0 (r = 0). Average then equals each leg.
         let chain = flat_iv_chain(100.0, 5.0, 10, 0.25, 0.5);

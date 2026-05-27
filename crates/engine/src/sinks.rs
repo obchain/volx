@@ -229,3 +229,105 @@ fn leg_envelope(s: &Strip) -> serde_json::Value {
         "quotes":           quotes,
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+    use volx_shared_types::ids::IndexId;
+    use volx_shared_types::index::{IndexValue, StripHash};
+    use volx_shared_types::strip::StripQuote;
+    use volx_shared_types::units::Years;
+
+    #[allow(clippy::cast_precision_loss)] // tiny n_points in fixtures (≤ 32)
+    fn fixture_strip(forward: f64, k_zero: f64, t_y: f64, n_points: usize) -> Strip {
+        let mut quotes = Vec::with_capacity(n_points);
+        let step = forward * 0.01;
+        for i in 0..n_points {
+            let k = forward - step * (n_points as f64 / 2.0) + step * i as f64;
+            quotes.push(StripQuote {
+                strike: k,
+                q_usd: 1.0 + i as f64 * 0.01,
+                iv: 0.5 + i as f64 * 0.001,
+            });
+        }
+        Strip {
+            forward,
+            k_zero,
+            time_to_expiry: Years(t_y),
+            quotes,
+        }
+    }
+
+    fn fixture_index_value() -> IndexValue {
+        IndexValue {
+            index_id: IndexId::Bvol,
+            value: 42.5,
+            confidence: 0.95,
+            strip_hash: StripHash([7u8; 32]),
+            ts: datetime!(2026-05-27 12:00:00 UTC),
+        }
+    }
+
+    #[test]
+    fn leg_envelope_pins_field_names_and_quotes_triple_shape() {
+        let strip = fixture_strip(100.0, 99.5, 30.0 / 365.0, 4);
+        let env = leg_envelope(&strip);
+
+        assert_eq!(env["forward"], 100.0);
+        assert_eq!(env["k_zero"], 99.5);
+        assert!((env["time_to_expiry_y"].as_f64().unwrap() - 30.0 / 365.0).abs() < 1e-12);
+
+        let quotes = env["quotes"].as_array().unwrap();
+        assert_eq!(quotes.len(), 4);
+        // Each entry is a JSON array (not object) of length 3 in [K, Q, iv]
+        // order — the public-API contract.
+        for (i, q) in quotes.iter().enumerate() {
+            let arr = q.as_array().unwrap();
+            assert_eq!(arr.len(), 3, "entry {i} should be [K, Q, iv] triple");
+            assert_eq!(arr[0], strip.quotes[i].strike);
+            assert_eq!(arr[1], strip.quotes[i].q_usd);
+            assert_eq!(arr[2], strip.quotes[i].iv);
+        }
+    }
+
+    #[test]
+    fn strip_envelope_wraps_two_legs_with_top_level_id_and_ts() {
+        let near = fixture_strip(100.0, 99.5, 7.0 / 365.0, 3);
+        let next = fixture_strip(100.0, 99.5, 40.0 / 365.0, 3);
+        let iv = fixture_index_value();
+
+        let env = strip_envelope(&iv, &near, &next);
+
+        assert_eq!(env["index_id"], "BVOL");
+        // `ts` is currently serialized via `time::OffsetDateTime`'s default
+        // serializer (numeric array), not the IndexValue's `rfc3339` form
+        // — tracked as #73. The bug-fix PR flips this assertion to a
+        // proper string check.
+        assert!(!env["ts"].is_null(), "ts must be emitted in some form");
+
+        // Both legs present with leg_envelope shape inherited.
+        assert_eq!(env["near"]["forward"], 100.0);
+        assert_eq!(env["next"]["forward"], 100.0);
+        assert!(
+            (env["near"]["time_to_expiry_y"].as_f64().unwrap() - 7.0 / 365.0).abs() < 1e-12
+        );
+        assert!(
+            (env["next"]["time_to_expiry_y"].as_f64().unwrap() - 40.0 / 365.0).abs() < 1e-12
+        );
+
+        // Near + next are distinct envelopes (no aliasing).
+        assert_ne!(env["near"], env["next"]);
+    }
+
+    #[test]
+    fn strip_envelope_preserves_quote_count_per_leg() {
+        let near = fixture_strip(100.0, 99.5, 7.0 / 365.0, 5);
+        let next = fixture_strip(100.0, 99.5, 40.0 / 365.0, 7);
+        let iv = fixture_index_value();
+        let env = strip_envelope(&iv, &near, &next);
+        assert_eq!(env["near"]["quotes"].as_array().unwrap().len(), 5);
+        assert_eq!(env["next"]["quotes"].as_array().unwrap().len(), 7);
+    }
+}
