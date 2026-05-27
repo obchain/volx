@@ -54,6 +54,12 @@ const REST_INSTRUMENTS: &str = "https://api.bybit.com/v5/market/instruments-info
 /// Bybit accepts up to 10 args per subscribe frame on v5 public WS;
 /// pinning to a conservative batch size avoids the WSPING-induced
 /// connection reset some clients observe on larger bursts.
+///
+/// Rate-budget note: Bybit v5 public WS imposes ~500 messages / 10 s
+/// per connection. At ~1 000 symbols/2 assets = 100 subscribe frames,
+/// the burst occupies ~20 % of the cap per window — comfortably safe.
+/// A 5× symbol-count growth would still fit; revisit if Bybit's option
+/// universe ever crosses ~5 000 strikes.
 const SUBSCRIBE_BATCH: usize = 10;
 
 /// Wall-clock deadline between successive frames. Bybit's ticker pushes
@@ -168,9 +174,20 @@ pub(crate) async fn connect_and_stream(
             continue;
         }
         let Some(data) = envelope.data else {
+            // A `tickers.*` push frame with no parseable `data` field
+            // is a real anomaly (the COMMAND_RESP path already
+            // continue'd above). Surface it so a schema migration
+            // doesn't silently degrade the feed to zero.
+            warn!(
+                topic,
+                "Bybit tickers push frame missing or unparseable data; possible schema change"
+            );
             continue;
         };
-        let ts_ms = envelope.ts.unwrap_or_default();
+        let Some(ts_ms) = envelope.ts else {
+            warn!(topic, "Bybit push frame missing envelope ts; skipping");
+            continue;
+        };
         let tick = match data_to_tick(&data, ts_ms) {
             Ok(t) => t,
             Err(e) => {
@@ -341,6 +358,11 @@ struct InstrumentsResponse {
 #[derive(Debug, Deserialize)]
 struct InstrumentsResult {
     list: Vec<InstrumentRow>,
+    /// Pagination cursor — non-empty when the page was truncated.
+    /// We follow it until empty to cover universes that grow past
+    /// the per-page cap (1 000 today, soft cap on Bybit's side).
+    #[serde(rename = "nextPageCursor", default)]
+    next_page_cursor: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,30 +378,76 @@ async fn fetch_symbols(client: &reqwest::Client, asset: Asset) -> Result<Vec<Str
         Asset::Btc => "BTC",
         Asset::Eth => "ETH",
     };
-    let url = format!("{REST_INSTRUMENTS}?category=option&baseCoin={base_coin}&limit=1000");
-    let resp: InstrumentsResponse = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?
-        .error_for_status()
-        .with_context(|| format!("status {url}"))?
-        .json()
-        .await
-        .with_context(|| format!("decode {url}"))?;
-    if resp.ret_code != 0 {
-        bail!("Bybit instruments-info retCode={}", resp.ret_code);
+    // Page through `nextPageCursor` so a future symbol count above the
+    // per-page cap (1 000 today) is still fully fetched. Without this
+    // the WS subscribe would silently cover only the first page.
+    let mut names: Vec<String> = Vec::new();
+    let mut cursor = String::new();
+    let mut page_idx: u32 = 0;
+    loop {
+        let mut url = format!("{REST_INSTRUMENTS}?category=option&baseCoin={base_coin}&limit=1000");
+        if !cursor.is_empty() {
+            url.push_str("&cursor=");
+            url.push_str(&urlencode(&cursor));
+        }
+        let resp: InstrumentsResponse = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
+            .with_context(|| format!("status {url}"))?
+            .json()
+            .await
+            .with_context(|| format!("decode {url}"))?;
+        if resp.ret_code != 0 {
+            bail!("Bybit instruments-info retCode={}", resp.ret_code);
+        }
+        let result = resp.result.context("missing result")?;
+        names.extend(
+            result
+                .list
+                .into_iter()
+                .filter(|r| r.status == "Trading")
+                .filter(|r| r.quote_coin == "USDT")
+                .map(|r| r.symbol),
+        );
+        page_idx = page_idx.saturating_add(1);
+        if result.next_page_cursor.is_empty() {
+            break;
+        }
+        cursor = result.next_page_cursor;
+        // Safety cap so a server bug producing a self-referential
+        // cursor cannot lock us into an infinite REST loop.
+        if page_idx >= 16 {
+            warn!(
+                asset = ?asset,
+                pages = page_idx,
+                "Bybit instruments-info pagination cap hit; stopping"
+            );
+            break;
+        }
     }
-    let result = resp.result.context("missing result")?;
-    let names: Vec<String> = result
-        .list
-        .into_iter()
-        .filter(|r| r.status == "Trading")
-        .filter(|r| r.quote_coin == "USDT")
-        .map(|r| r.symbol)
-        .collect();
-    info!(asset = ?asset, count = names.len(), "Bybit symbols fetched");
+    info!(asset = ?asset, count = names.len(), pages = page_idx, "Bybit symbols fetched");
     Ok(names)
+}
+
+/// Tiny URL-component encoder — enough to escape the Bybit
+/// `nextPageCursor` string (which is opaque but may contain `+` or `/`).
+/// Avoids pulling in a full `url` / `percent-encoding` crate dependency.
+fn urlencode(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            // `write!` avoids the `format!`-to-temp-`String` allocation
+            // clippy::format_push_string flags. Cannot fail on a `String`.
+            let _ = write!(&mut out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 // ---------- WS frame structures ----------
@@ -418,7 +486,11 @@ struct TickerData {
     bid_iv: Option<String>,
     #[serde(rename = "askIv")]
     ask_iv: Option<String>,
+    /// Mark price — currently unread (we publish bid/ask mid), kept on
+    /// the struct so a future #61 cross-venue sanity check can consume
+    /// it without re-touching the wire shape.
     #[serde(rename = "markPrice")]
+    #[allow(dead_code)]
     mark_price: Option<String>,
     #[serde(rename = "markPriceIv")]
     mark_price_iv: Option<String>,
@@ -446,8 +518,15 @@ fn data_to_tick(d: &TickerData, ts_ms: i64) -> Result<OptionTick> {
         _ => None,
     };
 
-    // Prefer markPriceIv (the venue's published mark IV); fall back to a
-    // bid/ask IV midpoint when the mark field is empty.
+    // IV preference: markPriceIv (venue's published mark IV) → bid/ask
+    // midpoint when mark is blank. The midpoint requires BOTH sides
+    // present by design: a one-sided IV on a deep-OTM contract is
+    // typically a stale or stub quote, and feeding it into the IV
+    // surface would skew the spline more than dropping the strike.
+    // The engine's `pick_iv` already handles `iv = None` cleanly via
+    // its call/put fallback, so dropping here is the conservative
+    // choice. Revisit if cross-venue blend (#61) shows we are losing
+    // useful signal on the wings.
     let iv = d
         .mark_price_iv
         .as_deref()
@@ -463,7 +542,18 @@ fn data_to_tick(d: &TickerData, ts_ms: i64) -> Result<OptionTick> {
         .as_deref()
         .and_then(parse_decimal_opt)
         .or_else(|| d.underlying_price.as_deref().and_then(parse_decimal_opt))
-        .unwrap_or(f64::NAN);
+        .unwrap_or_else(|| {
+            // Both `indexPrice` and `underlyingPrice` blank — observed
+            // on deep-OTM contracts with no quotes. NaN is the only
+            // sentinel `OptionTick.underlying: f64` admits; log so a
+            // wave of NaN underlyings is visible in Loki / Sentry
+            // rather than silently propagating into the vol surface.
+            debug!(
+                symbol,
+                "Bybit indexPrice + underlyingPrice both absent; underlying = NaN"
+            );
+            f64::NAN
+        });
 
     let open_interest = d
         .open_interest
@@ -478,7 +568,9 @@ fn data_to_tick(d: &TickerData, ts_ms: i64) -> Result<OptionTick> {
 
     let received_at = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ts_ms) * 1_000_000)
         .with_context(|| format!("ts {ts_ms} out of range"))?;
-    let _ = d.mark_price; // currently unused (we publish bid/ask mid); reserved
+    // `mark_price` is intentionally not consumed today — we publish the
+    // bid/ask mid as the canonical USD price. Kept on `TickerData` so
+    // a future #61 follow-up can use it as a cross-venue sanity check.
 
     Ok(OptionTick {
         venue: Venue::Bybit,
