@@ -55,6 +55,8 @@ FRONTEND_LOG="${LOG_DIR}/frontend.log"
 
 declare -a CHILD_PIDS=()
 declare -a TAIL_PIDS=()
+FRONTEND_PID=""        # tracked separately so teardown can pgrep -P its tree
+_TEARING_DOWN=0        # guard so the trap can't double-fire on Ctrl-C
 
 ING_BIN="${ROOT_DIR}/target/release/volx-ingestion"
 ENG_BIN="${ROOT_DIR}/target/release/volx-engine"
@@ -69,17 +71,32 @@ stage() { echo "==> $1" >&2; }
 
 teardown() {
   local rc=$?
+  # Guard so the trap fires once. SIGINT delivers to teardown, teardown's
+  # `exit` then fires the EXIT pseudo-signal which would re-enter without
+  # this latch — leading to double `compose down` and a clobbered rc.
+  [ "${_TEARING_DOWN}" = "1" ] && return
+  _TEARING_DOWN=1
   set +e
   echo "" >&2
   stage "teardown"
-  # Reap by binary name first — `cargo run` parents fork-exec the compiled
-  # binary, and Next.js spawns child workers that don't get the SIGTERM
-  # from killing the pnpm wrapper alone.
+  # Next.js spawns worker children whose argv doesn't contain "next dev"
+  # or "next-server", so neither pkill pattern catches them. Walk the
+  # frontend PID's child tree first, then kill the parent. Repeat for
+  # any deeper grandchild layer Next ever adds.
+  if [ -n "${FRONTEND_PID}" ]; then
+    pgrep -P "${FRONTEND_PID}" 2>/dev/null | while read -r child; do
+      pgrep -P "${child}" 2>/dev/null | xargs -r kill 2>/dev/null
+      kill "${child}" 2>/dev/null
+    done
+    kill "${FRONTEND_PID}" 2>/dev/null
+  fi
+  # Reap rust + go by binary name — `cargo run` parents fork-exec the
+  # compiled binary, so killing the recorded PID alone may not reap it.
   pkill -f "target/release/volx-ingestion" 2>/dev/null
   pkill -f "target/release/volx-engine" 2>/dev/null
   pkill -f "api/api-bin" 2>/dev/null
-  pkill -f "next dev" 2>/dev/null
   pkill -f "next-server" 2>/dev/null
+  pkill -f "next dev" 2>/dev/null
   for pid in "${CHILD_PIDS[@]:-}"; do
     [ -n "${pid:-}" ] && kill "${pid}" 2>/dev/null
   done
@@ -91,6 +108,9 @@ teardown() {
   lsof -ti ":${FRONTEND_PORT}" 2>/dev/null | xargs -r kill -9 2>/dev/null
   # Volumes preserved on purpose — re-runs keep ClickHouse history.
   docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" down >/dev/null 2>&1
+  # Prune stale log dirs from prior runs (older than 2 days). This script
+  # is a daily-driver launcher; /tmp would otherwise grow unbounded.
+  find /tmp -maxdepth 1 -name "volx-dev-*" -mtime +2 -exec rm -rf {} + 2>/dev/null
   echo "logs preserved in: ${LOG_DIR}" >&2
   echo "total runtime: $(elapsed_total)s" >&2
   exit "${rc}"
@@ -122,6 +142,30 @@ start_service() {
   CHILD_PIDS+=("$!")
 }
 
+# Pre-flight: bail loud if the port we're about to bind is already taken.
+# A stale process bound to the same port can let `curl --fail /v1/health`
+# return 200 from the wrong server, masking a "real" service that died
+# on startup with EADDRINUSE.
+check_port_free() {
+  local port="$1" label="$2"
+  if lsof -ti ":${port}" 2>/dev/null | grep -q .; then
+    local owner
+    owner=$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1" pid="$2}')
+    fail "port ${port} (${label}) already in use → ${owner}. Free it or override the port env var."
+  fi
+}
+
+# Fail-fast if any background service has died. Background process exit
+# does NOT trigger pipefail, so without this check a crashed ingestion
+# or engine wouldn't surface until well after READY is printed.
+check_services_alive() {
+  for pid in "${CHILD_PIDS[@]:-}"; do
+    if [ -n "${pid:-}" ] && ! kill -0 "${pid}" 2>/dev/null; then
+      fail "background service (pid ${pid}) died before stack was ready (check ${LOG_DIR})"
+    fi
+  done
+}
+
 # Optional log multiplexer — tail every service log with a [service] prefix.
 maybe_tail_logs() {
   [ "${LOGS}" = "1" ] || return 0
@@ -147,6 +191,12 @@ wait_until "clickhouse healthy" 60 \
 wait_until "redis healthy" 30 \
   "docker exec volx-redis redis-cli ping | grep -q PONG"
 
+stage "port-preflight"
+# Compose already owns 8123 + 6379 by this point; only check the two ports
+# our own binaries will try to claim.
+check_port_free "${API_PORT}"      "api"
+check_port_free "${FRONTEND_PORT}" "frontend"
+
 if [ "${SKIP_BUILD}" = "1" ]; then
   stage "build skipped (SKIP_BUILD=1)"
   [ -x "${ING_BIN}" ] || fail "SKIP_BUILD=1 but ${ING_BIN} not present"
@@ -170,12 +220,15 @@ start_service "api"       "${API_LOG}"       "${API_BIN}"
 stage "spawn frontend (pnpm dev) → ${FRONTEND_LOG}"
 ( cd "${ROOT_DIR}/frontend" && PORT="${FRONTEND_PORT}" pnpm dev ) \
   >"${FRONTEND_LOG}" 2>&1 &
-CHILD_PIDS+=("$!")
+FRONTEND_PID="$!"
+CHILD_PIDS+=("${FRONTEND_PID}")
 
 stage "api-ready"
+check_services_alive
 wait_until "api /v1/health" 60 "curl -sS --fail ${API_BASE}/v1/health"
 
 stage "frontend-ready"
+check_services_alive
 # Next dev needs ~2 s on warm cache, ~15 s cold (first-run TS compile).
 wait_until "frontend root" 60 "curl -sS --fail ${FRONTEND_URL}"
 
