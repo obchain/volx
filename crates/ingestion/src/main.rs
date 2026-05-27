@@ -72,6 +72,13 @@ async fn main() -> Result<()> {
             "deribit"
         });
     }
+    {
+        let tx = tx.clone();
+        venues.spawn(async move {
+            venues::okx::run_with_retry(vec![Asset::Btc, Asset::Eth], tx).await;
+            "okx"
+        });
+    }
     // Drop the original `tx`: each venue task holds its own clone. Without
     // this, the pipeline would never see `channel closed` because `main`
     // would keep one Sender alive forever.
