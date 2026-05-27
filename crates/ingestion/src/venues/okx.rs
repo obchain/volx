@@ -37,6 +37,15 @@ use volx_shared_types::{Asset, OptionKind, OptionTick, Venue};
 
 const WS_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
 
+/// Wall-clock deadline between successive WS frames. OKX leaves the
+/// connection open on a subscribe error (code 64000 etc.) and will not
+/// send anything further — without this timeout the read loop would
+/// park indefinitely, bypassing the reconnect + alert machinery. Sized
+/// at 60 s because `opt-summary` updates at ~1 Hz per instrument; a
+/// genuine quiet period beyond a minute is itself a venue problem
+/// worth a reconnect.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Outcome of one OKX session. Mirrors the Deribit module's discriminator
 /// so the reconnect loop can decide between "cycle and continue" and
 /// "stop" without inspecting the variant payload.
@@ -87,7 +96,15 @@ pub(crate) async fn connect_and_stream(
 
     let mut ticks_received: u64 = 0;
     let mut downstream_dropped = false;
-    while let Some(frame) = read.next().await {
+    loop {
+        let frame = match tokio::time::timeout(READ_TIMEOUT, read.next()).await {
+            Ok(Some(f)) => f,
+            Ok(None) => break, // stream ended cleanly
+            Err(_) => bail!(
+                "OKX session read idle for {}s (subscribe rejected or feed stalled)",
+                READ_TIMEOUT.as_secs()
+            ),
+        };
         let msg = frame.context("OKX WS frame")?;
         let payload = match msg {
             Message::Text(t) => t,
@@ -228,6 +245,15 @@ impl ReconnectState {
 /// Run the OKX connector with reconnect + exponential backoff. Returns
 /// only when the downstream `flume` receiver is dropped.
 pub(crate) async fn run_with_retry(assets: Vec<Asset>, tx: flume::Sender<OptionTick>) {
+    // One-shot breadcrumb so dashboard authors querying `underlying`
+    // across venues see why OKX values differ from Deribit's spot.
+    // Fires once per process start, searchable via `note=fwdPx`.
+    warn!(
+        venue = "okx",
+        note = "fwdPx",
+        "OKX OptionTick.underlying carries the per-instrument forward (fwdPx), not the spot index — opt-summary does not publish spot"
+    );
+
     let mut state = ReconnectState::default();
     loop {
         let outcome = connect_and_stream(&assets, tx.clone()).await;
@@ -345,13 +371,18 @@ fn summary_to_tick(row: &SummaryRow) -> Result<OptionTick> {
         .fwd_px
         .as_deref()
         .and_then(parse_decimal_opt)
-        .unwrap_or(f64::NAN);
-    let ts_ms: i64 = row
-        .ts
-        .as_deref()
-        .context("missing ts")?
+        .unwrap_or_else(|| {
+            // `underlying` is `f64`, not `Option<f64>`, so NaN is the only
+            // available sentinel. Log it once per occurrence so a quiet
+            // wave of NaN underlyings is observable in Loki / Sentry
+            // instead of silently propagating into the vol surface.
+            debug!(inst_id, "fwdPx absent or non-finite; underlying set to NaN");
+            f64::NAN
+        });
+    let ts_str = row.ts.as_deref().context("missing ts")?;
+    let ts_ms: i64 = ts_str
         .parse()
-        .with_context(|| format!("ts `{}` not i64", row.ts.as_deref().unwrap_or("")))?;
+        .with_context(|| format!("ts `{ts_str}` not i64"))?;
     let received_at = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ts_ms) * 1_000_000)
         .with_context(|| format!("ts {ts_ms} out of range"))?;
 
@@ -439,8 +470,12 @@ pub(crate) fn parse_instrument_id(name: &str) -> Result<(Asset, OffsetDateTime, 
 
 /// OKX dates are `YYMMDD` zero-padded. `260731` → 2026-07-31 08:00:00 UTC.
 fn parse_yymmdd(s: &str) -> Result<OffsetDateTime> {
-    if s.len() != 6 {
-        bail!("date `{s}` not exactly 6 digits");
+    // `is_ascii()` guard so the byte-indexed slicing below cannot panic
+    // on a multi-byte UTF-8 sequence — exchange data is always ASCII
+    // digits in practice, but a garbled frame should yield a clean
+    // `Err`, not a panic.
+    if s.len() != 6 || !s.is_ascii() {
+        bail!("date `{s}` not exactly 6 ASCII digits");
     }
     let year_2: i32 = s[0..2]
         .parse()
@@ -582,6 +617,19 @@ mod tests {
             ts: Some("not-a-number".into()),
         };
         assert!(summary_to_tick(&row).is_err());
+    }
+
+    #[test]
+    fn summary_row_rejects_missing_ts() {
+        let row = SummaryRow {
+            inst_type: Some("OPTION".into()),
+            inst_id: Some("BTC-USD-260731-64000-P".into()),
+            mark_vol: Some("0.5".into()),
+            fwd_px: Some("75000".into()),
+            ts: None,
+        };
+        let err = summary_to_tick(&row).unwrap_err();
+        assert!(err.to_string().contains("missing ts"));
     }
 
     #[test]
