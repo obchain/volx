@@ -1,0 +1,150 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same branch supersedes the prior run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0       # incremental adds no value in CI, hurts caching
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Rust: fmt + clippy + test on the four-crate workspace.
+  # ---------------------------------------------------------------------------
+  rust:
+    name: rust (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          components: rustfmt, clippy
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-features
+
+  # ---------------------------------------------------------------------------
+  # Go: vet + test under api/.
+  # ---------------------------------------------------------------------------
+  go:
+    name: go (vet + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: api/go.sum
+
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go build -o /tmp/api-bin ./cmd/api
+
+  # ---------------------------------------------------------------------------
+  # Frontend: lint + typecheck + build.
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: frontend (lint + typecheck + build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "9.15.0"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm build
+
+  # ---------------------------------------------------------------------------
+  # Integration: full local pipeline via scripts/e2e-smoke.sh.
+  #
+  # Deribit is reached from the runner — this can flake on upstream outages.
+  # If the public-net dependency proves too noisy a follow-up will move it
+  # behind a manual trigger; for now it gates merges because that is the
+  # entire point of having M1's smoke harness committed.
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: e2e (local pipeline smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [rust, go, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: api/go.sum
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: cargo cache (release profile)
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Smoke uses release binaries; reusing the rust job's debug-profile
+          # cache key would invalidate immediately. Separate namespace.
+          key: e2e-release
+
+      - run: pip install "websockets>=12,<13"
+
+      - name: run e2e smoke
+        env:
+          # ubuntu-latest runners are CPU-modest and cold; give the engine
+          # more room than the dev-box default. Two engine cycles + safety
+          # margin after Deribit instrument enumeration.
+          ENGINE_WAIT_S: "360"
+          WS_TIMEOUT_S: "120"
+          PYTHON_BIN: python3
+        run: bash scripts/e2e-smoke.sh
+
+      - name: upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: /tmp/volx-e2e-*/
+          if-no-files-found: ignore
+          retention-days: 7
