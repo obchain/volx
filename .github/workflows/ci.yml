@@ -32,7 +32,11 @@ jobs:
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          # Track current stable. clickhouse 0.15 brought in deps whose MSRV
+          # is 1.89 — pinning a specific version means we have to chase those
+          # bumps manually. Cargo.toml's `rust-version` is the authoritative
+          # MSRV claim; stable here is "the highest rustc that satisfies it".
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: cargo cache
@@ -110,7 +114,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          toolchain: stable
 
       - uses: actions/setup-go@v5
         with:
