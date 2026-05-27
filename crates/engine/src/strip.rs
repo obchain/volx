@@ -603,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn single_side_wings_still_build_via_iv_fallback() {
+    fn lower_wing_put_fallback_upper_wing_call_primary_still_build() {
         // Top of the grid has only call IVs (no put), bottom has only
         // put IVs. As long as ≥ MIN_STRIP_QUOTES strikes carry a
         // usable IV (call OR put) and at least one strike has both
@@ -649,14 +649,60 @@ mod tests {
     }
 
     #[test]
+    fn upper_wing_put_fallback_still_build() {
+        // Mirror of the previous test: upper-wing legs carry put-side
+        // IV only (call_iv = None), exercising `pick_iv`'s put fallback
+        // on strikes above the forward. Without this case, the
+        // companion test only exercises the fallback on the lower wing.
+        let t = 0.25;
+        let iv = 0.5;
+        let f = 100.0;
+        let mut legs = vec![ChainLeg {
+            strike: f,
+            call_mid_usd: Some(call_price(f, f, t, 0.0, iv)),
+            put_mid_usd: Some(put_price(f, f, t, 0.0, iv)),
+            call_iv: Some(iv),
+            put_iv: Some(iv),
+        }];
+        for k in [80.0, 85.0, 90.0, 95.0] {
+            legs.push(ChainLeg {
+                strike: k,
+                call_mid_usd: None,
+                put_mid_usd: None,
+                call_iv: Some(iv),
+                put_iv: None,
+            });
+        }
+        // Upper wing — put-side IV only. `pick_iv` should fall back.
+        for k in [105.0, 110.0, 115.0, 120.0] {
+            legs.push(ChainLeg {
+                strike: k,
+                call_mid_usd: None,
+                put_mid_usd: None,
+                call_iv: None,
+                put_iv: Some(iv),
+            });
+        }
+        let chain = ExpiryChain {
+            time_to_expiry: Years(t),
+            legs,
+        };
+        let strip = build_strip(&chain).unwrap();
+        assert!((strip.forward - f).abs() < 1e-9);
+        assert_eq!(strip.quotes.len(), DENSE_GRID_POINTS);
+    }
+
+    #[test]
     fn rejects_when_forward_is_outside_listed_strike_range() {
         // Construct a chain where every strike sits well below the
         // implied forward — picker yields F outside [K_min, K_max] →
         // §4.3 step 3 rejects rather than extrapolating.
         let t = 0.25;
         let iv = 0.5;
-        // K's all below 50; the only two-sided leg pins F via a large
-        // C − P bias to push F above K_max.
+        // K's all in [10, 50]; the only two-sided leg pins F = 10 + 59 = 69
+        // via a large C − P bias to push F above K_max. If a future
+        // maintainer extends `legs` with K > 69 the test would silently
+        // pass for the wrong reason, so anchor K_max here.
         let legs = vec![
             ChainLeg {
                 strike: 10.0,
@@ -694,6 +740,18 @@ mod tests {
                 put_iv: Some(iv),
             },
         ];
+        // Anchor the K_max invariant so a future maintainer adding a
+        // leg above K=50 fails this test loudly instead of silently
+        // exiting via a different `BuildError` variant.
+        let k_max_fixture = legs
+            .iter()
+            .map(|l| l.strike)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            (k_max_fixture - 50.0).abs() < 1e-12,
+            "fixture K_max drifted: {k_max_fixture}"
+        );
+
         let chain = ExpiryChain {
             time_to_expiry: Years(t),
             legs,

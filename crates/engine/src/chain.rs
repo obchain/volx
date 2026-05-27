@@ -395,7 +395,14 @@ mod tests {
         let now = datetime!(2026-05-25 00:00:00 UTC);
         let exp = now + time::Duration::days(7);
         let rows = vec![
-            row("btc", exp, 100.0, "call", Some(f64::NAN), Some(f64::INFINITY)),
+            row(
+                "btc",
+                exp,
+                100.0,
+                "call",
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+            ),
             row("btc", exp, 100.0, "put", Some(2.0), Some(0.5)),
         ];
         let out = assemble_chains(rows, now);
