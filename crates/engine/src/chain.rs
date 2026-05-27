@@ -136,6 +136,16 @@ pub async fn fetch_chains(client: &Client, now: OffsetDateTime) -> Result<AssetC
         cutoff_ms, "fetched latest ticks for chain build"
     );
 
+    Ok(assemble_chains(rows, now))
+}
+
+/// Fold a flat list of [`ChainRow`]s into per-asset, per-expiry chains.
+///
+/// Pulled out of [`fetch_chains`] so the row-→-tree logic can be tested
+/// without a `ClickHouse` connection. Unknown assets / kinds and
+/// non-finite strikes are dropped silently (the warn-log path lives
+/// here too, so the test surface stays honest).
+fn assemble_chains(rows: Vec<ChainRow>, now: OffsetDateTime) -> AssetChains {
     let mut out: AssetChains = HashMap::new();
     for row in rows {
         let Some(asset) = parse_asset(&row.asset) else {
@@ -191,7 +201,7 @@ pub async fn fetch_chains(client: &Client, now: OffsetDateTime) -> Result<AssetC
         let _ = (row.bid, row.ask, row.underlying); // currently unused at chain level; reserved for future filters
     }
 
-    Ok(out)
+    out
 }
 
 fn parse_asset(s: &str) -> Option<Asset> {
@@ -262,5 +272,154 @@ mod tests {
         assert_eq!(parse_kind("call"), Some(OptionKind::Call));
         assert_eq!(parse_kind("put"), Some(OptionKind::Put));
         assert_eq!(parse_kind("straddle"), None);
+    }
+
+    // ------- assemble_chains tests ------------------------------------
+
+    fn row(
+        asset: &str,
+        expiry: OffsetDateTime,
+        strike: f64,
+        kind: &str,
+        mid: Option<f64>,
+        iv: Option<f64>,
+    ) -> ChainRow {
+        ChainRow {
+            asset: asset.to_string(),
+            expiry,
+            strike,
+            kind: kind.to_string(),
+            bid: None,
+            ask: None,
+            mid,
+            iv,
+            underlying: 100_000.0,
+        }
+    }
+
+    #[test]
+    fn assemble_drops_unknown_asset() {
+        let now = datetime!(2026-05-25 00:00:00 UTC);
+        let exp = now + time::Duration::days(7);
+        let rows = vec![
+            row("btc", exp, 100.0, "call", Some(1.0), Some(0.5)),
+            row("doge", exp, 100.0, "call", Some(1.0), Some(0.5)),
+        ];
+        let out = assemble_chains(rows, now);
+        assert!(out.contains_key(&Asset::Btc));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn assemble_drops_unknown_kind() {
+        let now = datetime!(2026-05-25 00:00:00 UTC);
+        let exp = now + time::Duration::days(7);
+        let rows = vec![
+            row("btc", exp, 100.0, "call", Some(1.0), Some(0.5)),
+            row("btc", exp, 100.0, "straddle", Some(1.0), Some(0.5)),
+        ];
+        let out = assemble_chains(rows, now);
+        let chain = &out[&Asset::Btc][&exp];
+        assert_eq!(chain.legs.len(), 1);
+        assert!(chain.legs[0].call_mid_usd.is_some());
+        assert!(chain.legs[0].put_mid_usd.is_none());
+    }
+
+    #[test]
+    fn assemble_drops_non_finite_or_non_positive_strike() {
+        let now = datetime!(2026-05-25 00:00:00 UTC);
+        let exp = now + time::Duration::days(7);
+        let rows = vec![
+            row("btc", exp, f64::NAN, "call", Some(1.0), Some(0.5)),
+            row("btc", exp, f64::INFINITY, "call", Some(1.0), Some(0.5)),
+            row("btc", exp, -50.0, "call", Some(1.0), Some(0.5)),
+            row("btc", exp, 0.0, "call", Some(1.0), Some(0.5)),
+            row("btc", exp, 100.0, "call", Some(1.0), Some(0.5)),
+        ];
+        let out = assemble_chains(rows, now);
+        let chain = &out[&Asset::Btc][&exp];
+        assert_eq!(chain.legs.len(), 1, "only the K=100 row should survive");
+        assert_eq!(chain.legs[0].strike, 100.0);
+    }
+
+    #[test]
+    fn assemble_folds_call_and_put_into_one_leg() {
+        let now = datetime!(2026-05-25 00:00:00 UTC);
+        let exp = now + time::Duration::days(7);
+        let rows = vec![
+            row("btc", exp, 100.0, "call", Some(5.0), Some(0.5)),
+            row("btc", exp, 100.0, "put", Some(4.0), Some(0.55)),
+        ];
+        let out = assemble_chains(rows, now);
+        let chain = &out[&Asset::Btc][&exp];
+        assert_eq!(chain.legs.len(), 1);
+        assert_eq!(chain.legs[0].strike, 100.0);
+        assert_eq!(chain.legs[0].call_mid_usd, Some(5.0));
+        assert_eq!(chain.legs[0].put_mid_usd, Some(4.0));
+        assert_eq!(chain.legs[0].call_iv, Some(0.5));
+        assert_eq!(chain.legs[0].put_iv, Some(0.55));
+    }
+
+    #[test]
+    fn assemble_isolates_btc_and_eth() {
+        let now = datetime!(2026-05-25 00:00:00 UTC);
+        let exp = now + time::Duration::days(7);
+        let rows = vec![
+            row("btc", exp, 100_000.0, "call", Some(5.0), Some(0.5)),
+            row("eth", exp, 3_000.0, "call", Some(2.0), Some(0.6)),
+        ];
+        let out = assemble_chains(rows, now);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[&Asset::Btc][&exp].legs[0].strike, 100_000.0);
+        assert_eq!(out[&Asset::Eth][&exp].legs[0].strike, 3_000.0);
+    }
+
+    #[test]
+    fn assemble_isolates_expiries_within_an_asset() {
+        let now = datetime!(2026-05-25 00:00:00 UTC);
+        let near = now + time::Duration::days(7);
+        let far = now + time::Duration::days(40);
+        let rows = vec![
+            row("btc", near, 100.0, "call", Some(1.0), Some(0.5)),
+            row("btc", far, 100.0, "call", Some(2.0), Some(0.55)),
+        ];
+        let out = assemble_chains(rows, now);
+        let by_expiry = &out[&Asset::Btc];
+        assert_eq!(by_expiry.len(), 2);
+        assert!((by_expiry[&near].time_to_expiry.0 - 7.0 / 365.0).abs() < 1e-12);
+        assert!((by_expiry[&far].time_to_expiry.0 - 40.0 / 365.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn assemble_filters_non_finite_iv_and_mid() {
+        let now = datetime!(2026-05-25 00:00:00 UTC);
+        let exp = now + time::Duration::days(7);
+        let rows = vec![
+            row("btc", exp, 100.0, "call", Some(f64::NAN), Some(f64::INFINITY)),
+            row("btc", exp, 100.0, "put", Some(2.0), Some(0.5)),
+        ];
+        let out = assemble_chains(rows, now);
+        let leg = &out[&Asset::Btc][&exp].legs[0];
+        assert_eq!(leg.call_mid_usd, None, "NaN mid filtered to None");
+        assert_eq!(leg.call_iv, None, "Inf iv filtered to None");
+        assert_eq!(leg.put_mid_usd, Some(2.0));
+        assert_eq!(leg.put_iv, Some(0.5));
+    }
+
+    #[test]
+    fn assemble_uses_passed_now_for_time_to_expiry() {
+        let now = datetime!(2026-01-01 00:00:00 UTC);
+        let exp = datetime!(2026-01-31 00:00:00 UTC);
+        let rows = vec![row("btc", exp, 100.0, "call", Some(1.0), Some(0.5))];
+        let out = assemble_chains(rows, now);
+        let tt = out[&Asset::Btc][&exp].time_to_expiry.0;
+        assert!((tt - 30.0 / 365.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn assemble_empty_input_yields_empty_map() {
+        let now = datetime!(2026-05-25 00:00:00 UTC);
+        let out = assemble_chains(Vec::new(), now);
+        assert!(out.is_empty());
     }
 }
