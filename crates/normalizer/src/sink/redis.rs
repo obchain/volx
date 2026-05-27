@@ -140,10 +140,10 @@ impl RedisPublisher {
     pub async fn shutdown(self) {
         let Self { tx, join, .. } = self;
         drop(tx);
-        if let Some(join) = join {
-            if let Err(e) = join.await {
-                error!(error = ?e, "redis worker join error");
-            }
+        if let Some(join) = join
+            && let Err(e) = join.await
+        {
+            error!(error = ?e, "redis worker join error");
         }
     }
 }
