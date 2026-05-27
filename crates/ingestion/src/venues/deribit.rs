@@ -340,10 +340,11 @@ pub(crate) async fn run_with_retry(assets: Vec<Asset>, tx: flume::Sender<OptionT
 
 fn emit_threshold_alerts(state: &mut ReconnectState) {
     // Cross-boundary edge (`== ALERT`) is logged once per outage; the
-    // structured `threshold` field is what #11 attaches Prometheus +
-    // Sentry breadcrumb backends to.
+    // structured `threshold` + `venue` fields are what #11 attaches
+    // Prometheus + Sentry breadcrumb backends to.
     if state.consecutive == CONSECUTIVE_FAILURES_ALERT {
         error!(
+            venue = "deribit",
             threshold = "consecutive_failures",
             consecutive = state.consecutive,
             "Deribit reconnect threshold reached (Prometheus counter + Sentry breadcrumb)"
@@ -352,6 +353,7 @@ fn emit_threshold_alerts(state: &mut ReconnectState) {
     if state.current_downtime() >= DOWNTIME_ALERT && !state.notified_downtime {
         state.notified_downtime = true;
         error!(
+            venue = "deribit",
             threshold = "downtime_10min",
             downtime_s = state.current_downtime().as_secs(),
             "Deribit downtime exceeded 10 min (ntfy push)"
