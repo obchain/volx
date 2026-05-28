@@ -30,6 +30,7 @@
 //! future schema bump and uses the metric as the visibility signal.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -39,9 +40,10 @@ use volx_shared_types::index::{IndexValue, StripHash};
 use volx_shared_types::strip::Strip;
 
 use crate::blend;
-use crate::chain::{AssetChains, MultiVenueChains};
+use crate::chain::{MultiVenueChains, VenueChains};
+use crate::confidence::{self, ConfidenceInputs, METHODOLOGY_MIN_STRIKES};
 use crate::interpolate::{ExpiryVariance, bvol, interpolate_30d};
-use crate::strip::{BuildError, ExpiryChain, build_strip};
+use crate::strip::{BuildError, ExpiryChain, build_strip_with_count};
 use crate::variance::{VarianceError, variance_t};
 
 /// Time-to-expiry bounds (years). Hard-pinned from `METHODOLOGY.md`
@@ -130,8 +132,7 @@ impl SnapshotError {
 /// BVOL plus the two strips that produced it. Travels out so the
 /// scheduler can persist the strips (Redis `index:{id}:last_strip`,
 /// `/v1/options/strip` endpoint, #23) and so downstream issues
-/// (#62 confidence, #63 outlier-drop) can read the per-venue
-/// numbers.
+/// (#63 outlier-drop) can read the per-venue numbers.
 #[derive(Debug, Clone)]
 pub struct VenueSnapshot {
     pub venue: Venue,
@@ -139,6 +140,17 @@ pub struct VenueSnapshot {
     pub value: f64,
     pub near: Strip,
     pub next: Strip,
+    /// Listed-strike counts (post-filter, pre-spline) that produced
+    /// `near` and `next`. Feeds the confidence score's `strip_strikes`
+    /// term (issue #62) — the dense 801-point grid is always full
+    /// by construction so it can't tell a fat-listed venue from a
+    /// thin one.
+    pub listed_strikes_near: usize,
+    pub listed_strikes_next: usize,
+    /// Newest `options_ticks.ts` observed across this venue's
+    /// contributing rows. Feeds the confidence score's
+    /// `max_quote_age` term.
+    pub latest_ts: OffsetDateTime,
 }
 
 /// Full pipeline result: the blended [`IndexValue`] plus the per-venue
@@ -177,10 +189,18 @@ impl SnapshotResult {
 ///   [`SnapshotResult::per_venue_errors`] if the caller wants them
 ///   (but `SnapshotResult` is not constructed in this case — the
 ///   caller should log the [`SnapshotError`] reason label).
+///
+/// # Panics
+///
+/// Internal invariant: after the `per_venue.is_empty()` guard,
+/// `blend::median` on the non-empty per-venue BVOL slice cannot
+/// return `None`. An `expect()` enforces this — a panic here
+/// indicates a logic bug in the guard, never a data condition.
 pub fn run_snapshot(
     chains: &MultiVenueChains,
     index: IndexId,
     now: OffsetDateTime,
+    venues_expected: usize,
 ) -> Result<SnapshotResult, SnapshotError> {
     let asset = index.asset();
 
@@ -188,9 +208,9 @@ pub fn run_snapshot(
     // so the iteration order — and therefore the strip_hash, the
     // alpha-tiebreak for the median, and the chosen primary_strips()
     // venue — is deterministic.
-    let mut venues: Vec<(Venue, &AssetChains)> = chains
+    let mut venues: Vec<(Venue, &VenueChains)> = chains
         .iter()
-        .filter(|(_, per_venue)| per_venue.contains_key(&asset))
+        .filter(|(_, per_venue)| per_venue.assets.contains_key(&asset))
         .map(|(v, c)| (*v, c))
         .collect();
     if venues.is_empty() {
@@ -201,8 +221,8 @@ pub fn run_snapshot(
     let mut per_venue: Vec<VenueSnapshot> = Vec::with_capacity(venues.len());
     let mut per_venue_errors: Vec<(Venue, PerVenueError)> = Vec::new();
 
-    for (venue, asset_chains) in venues {
-        match run_venue_snapshot(venue, asset_chains, asset) {
+    for (venue, venue_chains) in venues {
+        match run_venue_snapshot(venue, venue_chains, asset) {
             Ok(vs) => per_venue.push(vs),
             Err(e) => {
                 warn!(
@@ -224,18 +244,19 @@ pub fn run_snapshot(
         });
     }
 
-    // Median over per-venue raw BVOLs. Empty case is unreachable
-    // (handled above) but `median` returns Option so the unwrap is
-    // total — keep it explicit rather than `expect`-panicking on a
-    // shape we just guarded.
+    // Median over per-venue raw BVOLs. `per_venue` is non-empty
+    // (guarded at the `per_venue.is_empty()` check above) and
+    // `raw_values.len() == per_venue.len()`, so `blend::median`
+    // cannot return `None` here. Use `expect` rather than swallowing
+    // the invariant into a `NoVenuesLive` arm that would silently
+    // drop the real `per_venue_errors` if a future refactor broke
+    // the guard.
     let raw_values: Vec<f64> = per_venue.iter().map(|v| v.value).collect();
-    let blended = blend::median(&raw_values).ok_or(SnapshotError::NoVenuesLive {
-        asset,
-        per_venue_errors: Vec::new(),
-    })?;
+    let blended = blend::median(&raw_values)
+        .expect("per_venue is non-empty (guarded above); median cannot return None");
 
     let strip_hash = compute_multi_venue_strip_hash(&per_venue);
-    let confidence = confidence_from_strips(&per_venue);
+    let confidence = confidence::score(confidence_inputs(&per_venue, venues_expected, now));
 
     debug!(
         index_id = ?index,
@@ -274,18 +295,21 @@ pub fn run_snapshot(
 /// roll-date metric.
 fn run_venue_snapshot(
     venue: Venue,
-    chains: &AssetChains,
+    chains: &VenueChains,
     asset: volx_shared_types::Asset,
 ) -> Result<VenueSnapshot, PerVenueError> {
     let per_asset = chains
+        .assets
         .get(&asset)
         .expect("run_snapshot pre-filters venues by asset; key must be present");
 
     let (near_chain, next_chain) =
         pick_expiries(per_asset).ok_or_else(|| pick_failure(per_asset))?;
 
-    let near_strip = build_strip(near_chain).map_err(PerVenueError::NearStrip)?;
-    let next_strip = build_strip(next_chain).map_err(PerVenueError::NextStrip)?;
+    let (near_strip, listed_strikes_near) =
+        build_strip_with_count(near_chain).map_err(PerVenueError::NearStrip)?;
+    let (next_strip, listed_strikes_next) =
+        build_strip_with_count(next_chain).map_err(PerVenueError::NextStrip)?;
 
     let near_sigma_sq = variance_t(&near_strip).map_err(PerVenueError::NearVariance)?;
     let next_sigma_sq = variance_t(&next_strip).map_err(PerVenueError::NextVariance)?;
@@ -302,7 +326,59 @@ fn run_venue_snapshot(
         value,
         near: near_strip,
         next: next_strip,
+        listed_strikes_near,
+        listed_strikes_next,
+        latest_ts: chains.latest_ts,
     })
+}
+
+/// Fold the per-venue snapshots + `now` into [`ConfidenceInputs`].
+///
+/// - `venues_live` = `per_venue.len()`. Pre-#62 every survivor
+///   counted equally; freshness penalty (per-venue) lives in
+///   `fresh_term` rather than gating venue count, keeping the two
+///   signals orthogonal and the dashboards readable.
+/// - `max_quote_age` = `now - min(latest_ts across live venues)`.
+///   "Min `latest_ts`" = "oldest of the newest" = worst-case
+///   freshness — a single quiet venue drags the score down.
+/// - `strip_strikes` = min listed-strike count across every venue ×
+///   {near, next}. Worst case per the issue spec.
+fn confidence_inputs(
+    per_venue: &[VenueSnapshot],
+    venues_expected: usize,
+    now: OffsetDateTime,
+) -> ConfidenceInputs {
+    let max_quote_age = per_venue
+        .iter()
+        .map(|v| {
+            let delta = now - v.latest_ts;
+            // `Duration::try_from` rejects negative (future-dated)
+            // deltas; treat them as "perfectly fresh" rather than
+            // panicking — a clock skew of a few hundred ms is
+            // operationally normal and should not flag the venue.
+            Duration::try_from(delta).unwrap_or_default()
+        })
+        .max()
+        // `per_venue` is non-empty (guarded at the
+        // `per_venue.is_empty()` check above); this branch is
+        // unreachable in production. `unwrap_or_default()` keeps
+        // the fn total for any caller that might later use it on
+        // an empty slice.
+        .unwrap_or_default();
+
+    let strip_strikes = per_venue
+        .iter()
+        .flat_map(|v| [v.listed_strikes_near, v.listed_strikes_next])
+        .min()
+        .unwrap_or(0);
+
+    ConfidenceInputs {
+        venues_live: per_venue.len(),
+        venues_expected,
+        max_quote_age,
+        strip_strikes,
+        methodology_min_strikes: METHODOLOGY_MIN_STRIKES,
+    }
 }
 
 /// §4.1 expiry picker. Returns `(near, next)` references into the
@@ -406,23 +482,12 @@ fn fold_strip_into_hash(h: &mut Sha256, s: &Strip) {
     }
 }
 
-/// Bare-bones confidence proxy. Both strips per venue are always
-/// 801-point dense grids by construction; the useful per-snapshot
-/// signal is the **listed-strike** count behind the spline fit — and
-/// (post-#61) the count of live venues — but neither is tracked on
-/// the `Strip` type today. For #20 + #61 we publish a constant `1.0`
-/// and the dedicated confidence issue (#62) populates this field.
-/// The column carries forward so #62 can promote the value without a
-/// schema migration.
-const fn confidence_from_strips(_per_venue: &[VenueSnapshot]) -> f64 {
-    1.0
-}
-
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
     use crate::bs::{call_price, put_price};
+    use crate::chain::AssetChains;
     use crate::strip::{ChainLeg, ExpiryChain};
     use volx_shared_types::Asset;
     use volx_shared_types::units::Years;
@@ -459,7 +524,11 @@ mod tests {
     fn build_single_venue_btc_chains(near_t: f64, next_t: f64, iv: f64) -> MultiVenueChains {
         let mut out: MultiVenueChains = HashMap::new();
         let per_venue = out.entry(Venue::Deribit).or_default();
-        let per_asset = per_venue.entry(Asset::Btc).or_default();
+        // Test fixtures peg `latest_ts` to the test `now` (-1 s) so
+        // the confidence path sees a fresh feed without having to
+        // wire wall-clock time into every fixture.
+        per_venue.latest_ts = time::macros::datetime!(2026-05-25 11:59:59 UTC);
+        let per_asset = per_venue.assets.entry(Asset::Btc).or_default();
         let near_expiry = time::macros::datetime!(2026-06-01 08:00:00 UTC);
         let next_expiry = time::macros::datetime!(2026-07-01 08:00:00 UTC);
         per_asset.insert(near_expiry, flat_iv_chain(100.0, 4.0, 30, near_t, iv));
@@ -475,7 +544,7 @@ mod tests {
         let next_t = 60.0 / 365.0; // 60 days
         let chains = build_single_venue_btc_chains(near_t, next_t, 0.5);
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
-        let res = run_snapshot(&chains, IndexId::Bvol, now).unwrap();
+        let res = run_snapshot(&chains, IndexId::Bvol, now, 3).unwrap();
         assert_eq!(res.value.index_id, IndexId::Bvol);
         // Tolerance is loose (5 vol points) because the synthetic
         // chain's wing truncation feeds into both σ² components.
@@ -501,14 +570,14 @@ mod tests {
         // survivors.
         let mut chains: MultiVenueChains = HashMap::new();
         let per_venue = chains.entry(Venue::Deribit).or_default();
-        let per_asset = per_venue.entry(Asset::Btc).or_default();
+        let per_asset = per_venue.assets.entry(Asset::Btc).or_default();
         let next_expiry = time::macros::datetime!(2026-07-01 08:00:00 UTC);
         per_asset.insert(
             next_expiry,
             flat_iv_chain(100.0, 4.0, 30, 60.0 / 365.0, 0.5),
         );
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
-        match run_snapshot(&chains, IndexId::Bvol, now) {
+        match run_snapshot(&chains, IndexId::Bvol, now, 3) {
             Err(SnapshotError::NoVenuesLive {
                 asset: Asset::Btc,
                 per_venue_errors,
@@ -528,7 +597,7 @@ mod tests {
     fn rejects_when_asset_missing_on_every_venue() {
         let chains: MultiVenueChains = HashMap::new();
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
-        match run_snapshot(&chains, IndexId::Bvol, now) {
+        match run_snapshot(&chains, IndexId::Bvol, now, 3) {
             Err(SnapshotError::MissingAsset(Asset::Btc)) => {}
             other => panic!("expected MissingAsset(Btc), got {other:?}"),
         }
@@ -569,8 +638,8 @@ mod tests {
     fn strip_hash_is_deterministic() {
         let chains = build_single_venue_btc_chains(14.0 / 365.0, 60.0 / 365.0, 0.5);
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
-        let a = run_snapshot(&chains, IndexId::Bvol, now).unwrap();
-        let b = run_snapshot(&chains, IndexId::Bvol, now).unwrap();
+        let a = run_snapshot(&chains, IndexId::Bvol, now, 3).unwrap();
+        let b = run_snapshot(&chains, IndexId::Bvol, now, 3).unwrap();
         assert_eq!(a.value.strip_hash, b.value.strip_hash);
     }
 
@@ -579,8 +648,8 @@ mod tests {
         let chains_lo = build_single_venue_btc_chains(14.0 / 365.0, 60.0 / 365.0, 0.4);
         let chains_hi = build_single_venue_btc_chains(14.0 / 365.0, 60.0 / 365.0, 0.5);
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
-        let a = run_snapshot(&chains_lo, IndexId::Bvol, now).unwrap();
-        let b = run_snapshot(&chains_hi, IndexId::Bvol, now).unwrap();
+        let a = run_snapshot(&chains_lo, IndexId::Bvol, now, 3).unwrap();
+        let b = run_snapshot(&chains_hi, IndexId::Bvol, now, 3).unwrap();
         assert_ne!(a.value.strip_hash, b.value.strip_hash);
     }
 

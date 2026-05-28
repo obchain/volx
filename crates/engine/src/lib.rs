@@ -26,6 +26,7 @@
 pub mod blend;
 pub mod bs;
 pub mod chain;
+pub mod confidence;
 pub mod interpolate;
 pub mod sinks;
 pub mod snapshot;

@@ -250,6 +250,67 @@ These are the M1 engine's contract with consumers.
 | Numerical precision      | All intermediate quantities in `f64`. No `f32` shortcuts.    |
 | Determinism              | Same inputs → same `f64` output, bit-for-bit, across engine instances. |
 
+### 5.1 Confidence
+
+Every published `IndexValue` carries a `confidence ∈ [0.0, 1.0]` scalar
+reflecting how trustworthy the snapshot is. The formula (`crates/engine/src/confidence.rs`):
+
+```
+venue_term  = min(venues_live  / venues_expected, 1)
+fresh_term  = clamp(1 - max_quote_age_s / 60, 0, 1)
+strike_term = min(strip_strikes / methodology_min_strikes, 1)
+confidence  = venue_term × fresh_term × strike_term
+```
+
+| Term | What it measures | Backing data |
+|---|---|---|
+| `venue_term`  | How many venues are contributing                 | `per_venue.len()` from the snapshot loop |
+| `fresh_term`  | Worst-case quote age across live venues          | `now - min(latest_ts)` from the per-venue chain query |
+| `strike_term` | Worst-case listed-strike count across all strips | `min(listed_strikes_near, listed_strikes_next)` per venue |
+
+**Multiplied, not averaged.** Each term is a necessary condition — a single
+venue with perfectly fresh data and a thin strip must not publish
+`confidence = 1.0`. Any one term collapsing to zero collapses the score.
+
+**Defaults pinned in the engine binary.**
+
+- `venues_expected = 3` (Deribit + OKX + Bybit), overridable via
+  `ENGINE_VENUES_EXPECTED` for the transitional period when only a subset
+  of connectors has shipped.
+- `methodology_min_strikes = 8`. This is the recommended count for a
+  defensible spline fit and is **distinct from** the strip-builder's
+  absolute floor (`MIN_STRIP_QUOTES = 5`, §4.3); a venue between those
+  two values still publishes but at reduced confidence.
+- Freshness budget: `60 s`. Equal to twice the chain query's freshness
+  window (`SNAPSHOT_FRESHNESS_SECS = 30 s`), so any data the engine
+  actually consumed has `fresh_term ≥ 0.5`.
+
+**Worked example A — full publish.** Three venues live, freshest quote 4 s
+old, all strips ≥ 8 listed strikes:
+
+```
+venue_term  = 3 / 3                = 1.00
+fresh_term  = 1 - 4 / 60           = 0.93
+strike_term = min(15 / 8, 1)       = 1.00
+confidence  = 1.00 × 0.93 × 1.00   = 0.93
+```
+
+**Worked example B — degraded mode.** Two venues live, oldest fresh quote
+20 s, one venue has 5 listed strikes (the absolute floor):
+
+```
+venue_term  = 2 / 3                = 0.67
+fresh_term  = 1 - 20 / 60          = 0.67
+strike_term = 5 / 8                = 0.625
+confidence  = 0.67 × 0.67 × 0.625  = 0.28
+```
+
+**What confidence is not.** It is a *leading* indicator of degraded mode —
+which venues are alive, how fresh the feed is, how fat each strip is. It
+is **not** a forecast of index error vs a ground-truth benchmark; that
+requires a backtest against the confidence-vs-error correlation per tick
+(research, out of scope for M2).
+
 ---
 
 ## 6. Relationship to Deribit DVOL
