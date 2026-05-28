@@ -1,0 +1,52 @@
+# Build artifacts — never copied into the build context. Local
+# `cargo build` writes ~10 GB into target/; uploading that to the
+# Docker daemon on every `docker compose build` is the single biggest
+# slowdown the project has.
+target/
+**/target/
+
+# Node + frontend build artifacts. The Go API + Rust services don't
+# need any of this; the frontend has no Dockerfile in this PR.
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+frontend/.next/
+frontend/out/
+
+# Editor + IDE caches.
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude state. Gitignored globally already; explicit here so a
+# misconfigured local git can never leak it into an image.
+.claude/
+
+# Local-only files the user explicitly does NOT want pushed (per
+# project CLAUDE.md hard rules).
+PRD.html
+
+# Markdown docs — keep README + LICENSE only. Everything else
+# (METHODOLOGY, runbook, incident-response, etc.) is reference for
+# the dev box, not the runtime image.
+*.md
+!README.md
+!LICENSE.md
+
+# Tests + research artifacts the runtime images don't need.
+research/
+docs/
+scripts/
+PRD/
+
+# Git metadata.
+.git/
+.gitignore
+.gitattributes
+
+# Existing Docker config (avoid recursive copy of compose into the image).
+docker/
+Dockerfile*
+.dockerignore

@@ -227,16 +227,38 @@ three non-negotiables.
 
 ## Quickstart
 
-Requires **Rust 1.85+** (edition 2024, resolver 3). No API keys, no
-database, no Docker — the ingestion binary runs straight from a fresh
-clone.
+### Full pipeline in Docker (recommended)
+
+Brings up storage (ClickHouse + Redis) **and** every service (ingestion,
+engine, API) in one command. No `cargo` / `go` toolchain required on the
+host:
 
 ```bash
-# 1. Clone
+git clone https://github.com/obchain/volx.git
+cd volx
+docker compose -f docker/docker-compose.yml up --build
+```
+
+First build is ~5–10 min (cargo-chef warming the dep cache); subsequent
+builds skip the warm cache and finish in seconds. After ~120 s:
+
+- `curl localhost:8080/v1/index/bvol/latest` returns a populated payload.
+- `curl localhost:9100/metrics` and `localhost:9101/metrics` expose the
+  ingestion + engine Prometheus surfaces.
+
+Stop with `Ctrl-C`. `docker compose down` keeps the ClickHouse + Redis
+data volumes; add `-v` to wipe them.
+
+### Hot-reload dev (Rust on host)
+
+Requires **Rust 1.89+** (edition 2024, resolver 3). No API keys, no
+database — the ingestion binary runs straight from a fresh clone:
+
+```bash
 git clone https://github.com/obchain/volx.git
 cd volx
 
-# 2. Live Deribit tick stream (≈500-1000 ticks/s sustained)
+# Live Deribit tick stream (≈500-1000 ticks/s sustained)
 cargo run --release -p volx-ingestion
 ```
 
