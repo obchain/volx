@@ -116,7 +116,34 @@ async fn run_tick(reader: &ChClient, sinks: &mut IndexSinks, now: OffsetDateTime
         let ticker = index.ticker();
         match snapshot::run_snapshot(&chains, index, now) {
             Ok(res) => {
-                if let Err(e) = sinks.publish(&res.value, &res.near, &res.next).await {
+                // Per-venue rejection counter is observability for the
+                // partial-survivor case — the blended publish below
+                // still succeeded, but a venue went dark for this tick.
+                for (venue, e) in &res.per_venue_errors {
+                    metrics::counter!(
+                        "volx_engine_per_venue_rejected_total",
+                        "index_id" => ticker.to_owned(),
+                        "venue" => venue.label(),
+                        "reason" => e.as_label(),
+                    )
+                    .increment(1);
+                }
+                // Use the first per-venue strip pair (alpha-sorted on
+                // Venue.label()) for the `last_strip` fanout. The
+                // strip-endpoint shape (#23) keeps a single near/next
+                // pair; a multi-strip fanout follows in a separate
+                // schema bump.
+                let Some((near, next)) = res.primary_strips() else {
+                    // Unreachable: per_venue is non-empty in any Ok
+                    // path — `run_snapshot` returns
+                    // `Err(NoVenuesLive)` otherwise.
+                    warn!(
+                        index_id = ticker,
+                        "snapshot succeeded with no per-venue strips — skipping publish"
+                    );
+                    continue;
+                };
+                if let Err(e) = sinks.publish(&res.value, near, next).await {
                     error!(index_id = ticker, error = %e, "publish failed");
                     metrics::counter!(
                         "volx_engine_publish_errors_total",
@@ -128,6 +155,8 @@ async fn run_tick(reader: &ChClient, sinks: &mut IndexSinks, now: OffsetDateTime
                         index_id = ticker,
                         value = res.value.value,
                         confidence = res.value.confidence,
+                        venues_live = res.per_venue.len(),
+                        venues_failed = res.per_venue_errors.len(),
                         "snapshot published"
                     );
                 }
@@ -140,6 +169,27 @@ async fn run_tick(reader: &ChClient, sinks: &mut IndexSinks, now: OffsetDateTime
                     "reason" => e.as_label(),
                 )
                 .increment(1);
+                // NoVenuesLive carries the per-venue breakdown so the
+                // total-failure case still feeds the per-venue counter
+                // — the partial-failure Ok path above does the same.
+                // Operators need this signal most when *every* venue
+                // is dark (the highest-severity state); without it
+                // they cannot tell roll-date events from data-quality
+                // regressions.
+                if let snapshot::SnapshotError::NoVenuesLive {
+                    per_venue_errors, ..
+                } = &e
+                {
+                    for (venue, per_venue_err) in per_venue_errors {
+                        metrics::counter!(
+                            "volx_engine_per_venue_rejected_total",
+                            "index_id" => ticker.to_owned(),
+                            "venue" => venue.label(),
+                            "reason" => per_venue_err.as_label(),
+                        )
+                        .increment(1);
+                    }
+                }
             }
         }
     }

@@ -25,6 +25,7 @@ use clickhouse::Client;
 use serde::Deserialize;
 use time::OffsetDateTime;
 use tracing::{debug, warn};
+use volx_shared_types::ids::Venue;
 use volx_shared_types::units::Years;
 use volx_shared_types::{Asset, OptionKind};
 
@@ -44,6 +45,7 @@ pub const SNAPSHOT_FRESHNESS_SECS: u32 = 30;
 /// Wire row from the `argMax(...) GROUP BY ...` query below.
 #[derive(Debug, Deserialize, clickhouse::Row)]
 struct ChainRow {
+    venue: String,
     asset: String,
     #[serde(with = "clickhouse::serde::time::datetime64::millis")]
     expiry: OffsetDateTime,
@@ -68,6 +70,15 @@ pub enum ChainError {
 /// keys on `Asset` and the inner map on `OffsetDateTime`.
 pub type AssetChains = HashMap<Asset, HashMap<OffsetDateTime, ExpiryChain>>;
 
+/// Per-venue, per-asset chains. Outer key is the venue the rows came
+/// from; the inner [`AssetChains`] follows the §4.1 per-venue picker
+/// (issue #61). One venue's chains never share a strip with another's
+/// — folding two venues' mid-quotes into one chain would silently
+/// mix legs whose bid/ask come from different order books and the
+/// strip builder's §4.2 forward picker would get a chain whose call
+/// and put legs disagree on the underlying.
+pub type MultiVenueChains = HashMap<Venue, AssetChains>;
+
 /// Pull the latest tick per `(asset, expiry, strike, kind)` from
 /// `ClickHouse` and assemble per-expiry chains.
 ///
@@ -88,7 +99,10 @@ pub type AssetChains = HashMap<Asset, HashMap<OffsetDateTime, ExpiryChain>>;
 /// scan if the timestamp ever overflows `i64` (year ≈ 292,000,000 —
 /// not reachable in any sane clock, but the right fallback is "skip
 /// the tick" not "rescan a year of history").
-pub async fn fetch_chains(client: &Client, now: OffsetDateTime) -> Result<AssetChains, ChainError> {
+pub async fn fetch_chains(
+    client: &Client,
+    now: OffsetDateTime,
+) -> Result<MultiVenueChains, ChainError> {
     let cutoff_ms = i64::try_from(
         now.unix_timestamp_nanos() / 1_000_000 - i128::from(SNAPSHOT_FRESHNESS_SECS) * 1000,
     )
@@ -99,17 +113,16 @@ pub async fn fetch_chains(client: &Client, now: OffsetDateTime) -> Result<AssetC
     // instrument. The `ts >= cutoff` filter drops stale rows so a
     // dead feed doesn't masquerade as a live snapshot.
     //
-    // `WHERE venue = 'deribit'` is a deliberate single-venue scoping.
-    // The schema is already multi-venue (`venue` sits in the
-    // `options_ticks` ORDER BY), but folding two venues' mid-quotes
-    // into one `argMax(mid, ts)` would silently mix legs whose
-    // bid/ask come from different order books — the strip builder
-    // would get a chain whose call and put legs disagree on the
-    // forward. TODO(#25): replace the literal with a per-venue
-    // GROUP BY + cross-venue best-quote merge when the OKX / Bybit
-    // connectors land.
+    // `venue` joins the GROUP BY so each venue's order book stays
+    // its own strip — folding two venues' mid-quotes into one
+    // `argMax(mid, ts)` would silently mix legs whose bid/ask come
+    // from different books and the §4.2 forward picker would get a
+    // chain whose call and put legs disagree on the underlying.
+    // The downstream snapshot orchestrator (#61) blends per-venue
+    // BVOLs with a median policy instead.
     let query = "
         SELECT
+            venue,
             asset,
             expiry,
             strike,
@@ -121,8 +134,7 @@ pub async fn fetch_chains(client: &Client, now: OffsetDateTime) -> Result<AssetC
             argMax(underlying, ts) AS underlying
         FROM volx.options_ticks
         WHERE ts >= fromUnixTimestamp64Milli(?)
-          AND venue = 'deribit'
-        GROUP BY asset, expiry, strike, kind
+        GROUP BY venue, asset, expiry, strike, kind
     ";
 
     let rows: Vec<ChainRow> = client
@@ -139,15 +151,19 @@ pub async fn fetch_chains(client: &Client, now: OffsetDateTime) -> Result<AssetC
     Ok(assemble_chains(rows, now))
 }
 
-/// Fold a flat list of [`ChainRow`]s into per-asset, per-expiry chains.
+/// Fold a flat list of [`ChainRow`]s into per-venue, per-asset, per-expiry chains.
 ///
 /// Pulled out of [`fetch_chains`] so the row-→-tree logic can be tested
-/// without a `ClickHouse` connection. Unknown assets / kinds and
+/// without a `ClickHouse` connection. Unknown venues / assets / kinds and
 /// non-finite strikes are dropped silently (the warn-log path lives
 /// here too, so the test surface stays honest).
-fn assemble_chains(rows: Vec<ChainRow>, now: OffsetDateTime) -> AssetChains {
-    let mut out: AssetChains = HashMap::new();
+fn assemble_chains(rows: Vec<ChainRow>, now: OffsetDateTime) -> MultiVenueChains {
+    let mut out: MultiVenueChains = HashMap::new();
     for row in rows {
+        let Some(venue) = parse_venue(&row.venue) else {
+            warn!(venue = %row.venue, "unknown venue in options_ticks; skipping");
+            continue;
+        };
         let Some(asset) = parse_asset(&row.asset) else {
             warn!(asset = %row.asset, "unknown asset in options_ticks; skipping");
             continue;
@@ -160,7 +176,8 @@ fn assemble_chains(rows: Vec<ChainRow>, now: OffsetDateTime) -> AssetChains {
             continue;
         }
 
-        let per_asset = out.entry(asset).or_default();
+        let per_venue = out.entry(venue).or_default();
+        let per_asset = per_venue.entry(asset).or_default();
         let chain = per_asset.entry(row.expiry).or_insert_with(|| ExpiryChain {
             time_to_expiry: year_fraction(now, row.expiry),
             legs: Vec::new(),
@@ -202,6 +219,17 @@ fn assemble_chains(rows: Vec<ChainRow>, now: OffsetDateTime) -> AssetChains {
     }
 
     out
+}
+
+fn parse_venue(s: &str) -> Option<Venue> {
+    // Mirror of `Venue::label()` — the normalizer writes these
+    // lowercase strings into `options_ticks.venue`.
+    match s {
+        "deribit" => Some(Venue::Deribit),
+        "okx" => Some(Venue::Okx),
+        "bybit" => Some(Venue::Bybit),
+        _ => None,
+    }
 }
 
 fn parse_asset(s: &str) -> Option<Asset> {
@@ -277,6 +305,7 @@ mod tests {
     // ------- assemble_chains tests ------------------------------------
 
     fn row(
+        venue: &str,
         asset: &str,
         expiry: OffsetDateTime,
         strike: f64,
@@ -285,6 +314,7 @@ mod tests {
         iv: Option<f64>,
     ) -> ChainRow {
         ChainRow {
+            venue: venue.to_string(),
             asset: asset.to_string(),
             expiry,
             strike,
@@ -298,16 +328,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_venue_known_variants() {
+        assert_eq!(parse_venue("deribit"), Some(Venue::Deribit));
+        assert_eq!(parse_venue("okx"), Some(Venue::Okx));
+        assert_eq!(parse_venue("bybit"), Some(Venue::Bybit));
+        assert_eq!(parse_venue("DERIBIT"), None); // case-sensitive — normalizer writes lowercase
+        assert_eq!(parse_venue("kraken"), None);
+    }
+
+    #[test]
+    fn assemble_drops_unknown_venue() {
+        let now = datetime!(2026-05-25 00:00:00 UTC);
+        let exp = now + time::Duration::days(7);
+        let rows = vec![
+            row("deribit", "btc", exp, 100.0, "call", Some(1.0), Some(0.5)),
+            row("kraken", "btc", exp, 100.0, "call", Some(1.0), Some(0.5)),
+        ];
+        let out = assemble_chains(rows, now);
+        assert!(out.contains_key(&Venue::Deribit));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
     fn assemble_drops_unknown_asset() {
         let now = datetime!(2026-05-25 00:00:00 UTC);
         let exp = now + time::Duration::days(7);
         let rows = vec![
-            row("btc", exp, 100.0, "call", Some(1.0), Some(0.5)),
-            row("doge", exp, 100.0, "call", Some(1.0), Some(0.5)),
+            row("deribit", "btc", exp, 100.0, "call", Some(1.0), Some(0.5)),
+            row("deribit", "doge", exp, 100.0, "call", Some(1.0), Some(0.5)),
         ];
         let out = assemble_chains(rows, now);
-        assert!(out.contains_key(&Asset::Btc));
-        assert_eq!(out.len(), 1);
+        let by_asset = &out[&Venue::Deribit];
+        assert!(by_asset.contains_key(&Asset::Btc));
+        assert_eq!(by_asset.len(), 1);
     }
 
     #[test]
@@ -315,11 +368,19 @@ mod tests {
         let now = datetime!(2026-05-25 00:00:00 UTC);
         let exp = now + time::Duration::days(7);
         let rows = vec![
-            row("btc", exp, 100.0, "call", Some(1.0), Some(0.5)),
-            row("btc", exp, 100.0, "straddle", Some(1.0), Some(0.5)),
+            row("deribit", "btc", exp, 100.0, "call", Some(1.0), Some(0.5)),
+            row(
+                "deribit",
+                "btc",
+                exp,
+                100.0,
+                "straddle",
+                Some(1.0),
+                Some(0.5),
+            ),
         ];
         let out = assemble_chains(rows, now);
-        let chain = &out[&Asset::Btc][&exp];
+        let chain = &out[&Venue::Deribit][&Asset::Btc][&exp];
         assert_eq!(chain.legs.len(), 1);
         assert!(chain.legs[0].call_mid_usd.is_some());
         assert!(chain.legs[0].put_mid_usd.is_none());
@@ -330,14 +391,30 @@ mod tests {
         let now = datetime!(2026-05-25 00:00:00 UTC);
         let exp = now + time::Duration::days(7);
         let rows = vec![
-            row("btc", exp, f64::NAN, "call", Some(1.0), Some(0.5)),
-            row("btc", exp, f64::INFINITY, "call", Some(1.0), Some(0.5)),
-            row("btc", exp, -50.0, "call", Some(1.0), Some(0.5)),
-            row("btc", exp, 0.0, "call", Some(1.0), Some(0.5)),
-            row("btc", exp, 100.0, "call", Some(1.0), Some(0.5)),
+            row(
+                "deribit",
+                "btc",
+                exp,
+                f64::NAN,
+                "call",
+                Some(1.0),
+                Some(0.5),
+            ),
+            row(
+                "deribit",
+                "btc",
+                exp,
+                f64::INFINITY,
+                "call",
+                Some(1.0),
+                Some(0.5),
+            ),
+            row("deribit", "btc", exp, -50.0, "call", Some(1.0), Some(0.5)),
+            row("deribit", "btc", exp, 0.0, "call", Some(1.0), Some(0.5)),
+            row("deribit", "btc", exp, 100.0, "call", Some(1.0), Some(0.5)),
         ];
         let out = assemble_chains(rows, now);
-        let chain = &out[&Asset::Btc][&exp];
+        let chain = &out[&Venue::Deribit][&Asset::Btc][&exp];
         assert_eq!(chain.legs.len(), 1, "only the K=100 row should survive");
         assert_eq!(chain.legs[0].strike, 100.0);
     }
@@ -347,11 +424,11 @@ mod tests {
         let now = datetime!(2026-05-25 00:00:00 UTC);
         let exp = now + time::Duration::days(7);
         let rows = vec![
-            row("btc", exp, 100.0, "call", Some(5.0), Some(0.5)),
-            row("btc", exp, 100.0, "put", Some(4.0), Some(0.55)),
+            row("deribit", "btc", exp, 100.0, "call", Some(5.0), Some(0.5)),
+            row("deribit", "btc", exp, 100.0, "put", Some(4.0), Some(0.55)),
         ];
         let out = assemble_chains(rows, now);
-        let chain = &out[&Asset::Btc][&exp];
+        let chain = &out[&Venue::Deribit][&Asset::Btc][&exp];
         assert_eq!(chain.legs.len(), 1);
         assert_eq!(chain.legs[0].strike, 100.0);
         assert_eq!(chain.legs[0].call_mid_usd, Some(5.0));
@@ -365,13 +442,66 @@ mod tests {
         let now = datetime!(2026-05-25 00:00:00 UTC);
         let exp = now + time::Duration::days(7);
         let rows = vec![
-            row("btc", exp, 100_000.0, "call", Some(5.0), Some(0.5)),
-            row("eth", exp, 3_000.0, "call", Some(2.0), Some(0.6)),
+            row(
+                "deribit",
+                "btc",
+                exp,
+                100_000.0,
+                "call",
+                Some(5.0),
+                Some(0.5),
+            ),
+            row("deribit", "eth", exp, 3_000.0, "call", Some(2.0), Some(0.6)),
         ];
         let out = assemble_chains(rows, now);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[&Asset::Btc][&exp].legs[0].strike, 100_000.0);
-        assert_eq!(out[&Asset::Eth][&exp].legs[0].strike, 3_000.0);
+        let by_asset = &out[&Venue::Deribit];
+        assert_eq!(by_asset.len(), 2);
+        assert_eq!(by_asset[&Asset::Btc][&exp].legs[0].strike, 100_000.0);
+        assert_eq!(by_asset[&Asset::Eth][&exp].legs[0].strike, 3_000.0);
+    }
+
+    #[test]
+    fn assemble_isolates_venues() {
+        // Same asset + expiry + strike across two venues: each
+        // venue keeps its own ChainLeg, so a fat-finger quote on
+        // one venue cannot contaminate the other's strip.
+        let now = datetime!(2026-05-25 00:00:00 UTC);
+        let exp = now + time::Duration::days(7);
+        let rows = vec![
+            row(
+                "deribit",
+                "btc",
+                exp,
+                100_000.0,
+                "call",
+                Some(5.0),
+                Some(0.50),
+            ),
+            row("okx", "btc", exp, 100_000.0, "call", Some(5.1), Some(0.51)),
+            row(
+                "bybit",
+                "btc",
+                exp,
+                100_000.0,
+                "call",
+                Some(4.9),
+                Some(0.49),
+            ),
+        ];
+        let out = assemble_chains(rows, now);
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            out[&Venue::Deribit][&Asset::Btc][&exp].legs[0].call_mid_usd,
+            Some(5.0)
+        );
+        assert_eq!(
+            out[&Venue::Okx][&Asset::Btc][&exp].legs[0].call_mid_usd,
+            Some(5.1)
+        );
+        assert_eq!(
+            out[&Venue::Bybit][&Asset::Btc][&exp].legs[0].call_mid_usd,
+            Some(4.9)
+        );
     }
 
     #[test]
@@ -380,11 +510,11 @@ mod tests {
         let near = now + time::Duration::days(7);
         let far = now + time::Duration::days(40);
         let rows = vec![
-            row("btc", near, 100.0, "call", Some(1.0), Some(0.5)),
-            row("btc", far, 100.0, "call", Some(2.0), Some(0.55)),
+            row("deribit", "btc", near, 100.0, "call", Some(1.0), Some(0.5)),
+            row("deribit", "btc", far, 100.0, "call", Some(2.0), Some(0.55)),
         ];
         let out = assemble_chains(rows, now);
-        let by_expiry = &out[&Asset::Btc];
+        let by_expiry = &out[&Venue::Deribit][&Asset::Btc];
         assert_eq!(by_expiry.len(), 2);
         assert!((by_expiry[&near].time_to_expiry.0 - 7.0 / 365.0).abs() < 1e-12);
         assert!((by_expiry[&far].time_to_expiry.0 - 40.0 / 365.0).abs() < 1e-12);
@@ -396,6 +526,7 @@ mod tests {
         let exp = now + time::Duration::days(7);
         let rows = vec![
             row(
+                "deribit",
                 "btc",
                 exp,
                 100.0,
@@ -403,10 +534,10 @@ mod tests {
                 Some(f64::NAN),
                 Some(f64::INFINITY),
             ),
-            row("btc", exp, 100.0, "put", Some(2.0), Some(0.5)),
+            row("deribit", "btc", exp, 100.0, "put", Some(2.0), Some(0.5)),
         ];
         let out = assemble_chains(rows, now);
-        let leg = &out[&Asset::Btc][&exp].legs[0];
+        let leg = &out[&Venue::Deribit][&Asset::Btc][&exp].legs[0];
         assert_eq!(leg.call_mid_usd, None, "NaN mid filtered to None");
         assert_eq!(leg.call_iv, None, "Inf iv filtered to None");
         assert_eq!(leg.put_mid_usd, Some(2.0));
@@ -417,9 +548,17 @@ mod tests {
     fn assemble_uses_passed_now_for_time_to_expiry() {
         let now = datetime!(2026-01-01 00:00:00 UTC);
         let exp = datetime!(2026-01-31 00:00:00 UTC);
-        let rows = vec![row("btc", exp, 100.0, "call", Some(1.0), Some(0.5))];
+        let rows = vec![row(
+            "deribit",
+            "btc",
+            exp,
+            100.0,
+            "call",
+            Some(1.0),
+            Some(0.5),
+        )];
         let out = assemble_chains(rows, now);
-        let tt = out[&Asset::Btc][&exp].time_to_expiry.0;
+        let tt = out[&Venue::Deribit][&Asset::Btc][&exp].time_to_expiry.0;
         assert!((tt - 30.0 / 365.0).abs() < 1e-12);
     }
 
