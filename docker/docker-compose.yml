@@ -191,6 +191,12 @@ services:
       # Bind all-interfaces so the published port works; same posture
       # as the Rust services above.
       API_BIND: "0.0.0.0:8080"
+      # Local-dev WS rate limit. Production default is 5 per IP (PRD §6
+      # — discourages a single browser from monopolising the broadcast
+      # pool). On a dev box every Next.js hot-reload, every devtools
+      # tab, and every refresh stacks fresh connections faster than the
+      # close-handshake reaps them, and 5 is exhausted in minutes.
+      WS_MAX_CONNS_PER_IP: "200"
     ports:
       # Host 8090 → container 8080. Host 8080 conflicts with another
       # local listener (aether-monitor); keep VolX off it.
