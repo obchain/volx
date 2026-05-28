@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import type { Route } from "next";
 import { usePathname } from "next/navigation";
 import { useIndexTicks, type ConnState } from "@/lib/useIndexTicks";
 import { ThemeToggle } from "./ThemeToggle";
@@ -75,7 +76,10 @@ function NavLink({
   active,
   children,
 }: {
-  href: string;
+  // next/link with `experimental.typedRoutes` requires the href to be
+  // the typed `Route` union, not a plain string. Callers pass route
+  // literals (e.g. "/methodology") so the type narrows at the call site.
+  href: Route;
   active: boolean;
   children: React.ReactNode;
 }) {
