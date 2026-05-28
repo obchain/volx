@@ -28,6 +28,7 @@ pub mod bs;
 pub mod chain;
 pub mod confidence;
 pub mod interpolate;
+pub mod outlier;
 pub mod sinks;
 pub mod snapshot;
 pub mod spline;

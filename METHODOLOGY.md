@@ -311,6 +311,62 @@ is **not** a forecast of index error vs a ground-truth benchmark; that
 requires a backtest against the confidence-vs-error correlation per tick
 (research, out of scope for M2).
 
+### 5.2 Venue outlier drop policy
+
+Median blend is robust against *one* tick of bad data but does not
+exclude a *persistently* misbehaving venue from the input set. A venue
+stuck on a frozen quote keeps skewing the median window after window.
+
+**Policy** (`crates/engine/src/outlier.rs`):
+
+> Drop a venue from the median blend input if its per-tick raw BVOL
+> deviates by more than `threshold_pct` (default **5%**) from the
+> current cross-venue median for `streak_required` (default **5**)
+> consecutive ticks. Re-include the venue on the first subsequent tick
+> back within the band.
+
+The deviation test is `|venue_bvol - median| / |median| > threshold_pct`,
+applied per tick against the median of the **input** slice (i.e. before
+any drops from this tick are applied). Streaks are tracked per
+`(index_id, venue)` so a streak on BVOL does not bleed into EVOL.
+
+Single-venue ticks (e.g. degraded mode where two of three venues failed
+their per-venue pipeline) are pass-through — the policy never drops the
+only live venue. That is an availability decision (`NoVenuesLive`),
+distinct from a quality decision.
+
+**Defaults pinned in the engine binary.**
+
+- `ENGINE_OUTLIER_THRESHOLD_PCT = 0.05` (5%). Overridable for the 30-day
+  DVOL benchmark match window.
+- `ENGINE_OUTLIER_STREAK = 5`. A single-tick transient (ratelimit
+  hiccup, brief gap) never gets a venue dropped.
+
+**Worked example — outlier drop after 5 ticks.**
+
+| Tick | Bybit | Deribit | Okx  | Median | Okx dev | Okx streak | Action |
+|---|---|---|---|---|---|---|---|
+| 1 | 50.0  | 50.0    | 53.0 | 50.0   | 6.0%    | 1          | none   |
+| 2 | 50.0  | 50.0    | 53.1 | 50.0   | 6.2%    | 2          | none   |
+| 3 | 50.0  | 50.0    | 53.0 | 50.0   | 6.0%    | 3          | none   |
+| 4 | 50.0  | 50.0    | 53.2 | 50.0   | 6.4%    | 4          | none   |
+| 5 | 50.0  | 50.0    | 53.0 | 50.0   | 6.0%    | 5          | **drop Okx** |
+| 6 | 50.0  | 50.0    | 50.1 | 50.0   | 0.2%    | 0          | **restore Okx** |
+
+After the drop, the median is computed over the active set (Bybit +
+Deribit) and the published `confidence` reflects `venues_live = 2`. A
+single in-band tick at #6 clears both the streak and the dropped set —
+no hysteresis, no warm-up delay.
+
+**Observability.**
+
+- `volx_engine_active_venues{index_id}` gauge — current size of the
+  outlier-active set; should equal `venues_live - currently_dropped`.
+- `volx_engine_outlier_drops_total{index_id,venue}` counter — increments
+  on each first-time drop (re-drop after restore counts).
+- INFO log per drop with structured fields `venue`, `venue_value`,
+  `median`, `deviation_pct`, `streak`; INFO log per restore.
+
 ---
 
 ## 6. Relationship to Deribit DVOL

@@ -43,6 +43,7 @@ use crate::blend;
 use crate::chain::{MultiVenueChains, VenueChains};
 use crate::confidence::{self, ConfidenceInputs, METHODOLOGY_MIN_STRIKES};
 use crate::interpolate::{ExpiryVariance, bvol, interpolate_30d};
+use crate::outlier::{EvalDelta, OutlierTracker, VenueValue};
 use crate::strip::{BuildError, ExpiryChain, build_strip_with_count};
 use crate::variance::{VarianceError, variance_t};
 
@@ -161,18 +162,42 @@ pub struct VenueSnapshot {
 #[derive(Debug)]
 pub struct SnapshotResult {
     pub value: IndexValue,
+    /// **Active** per-venue snapshots — the subset the blend
+    /// consumed after the outlier policy (#63) filtered out
+    /// persistent-deviator venues. Use [`Self::all_per_venue`] if
+    /// you need every venue including drops.
     pub per_venue: Vec<VenueSnapshot>,
+    /// Per-venue snapshots that survived the per-venue pipeline but
+    /// were **dropped by the outlier policy** on this tick. Empty
+    /// when the policy is inactive (single venue, or no streaks at
+    /// threshold).
+    pub per_venue_dropped: Vec<VenueSnapshot>,
+    /// Per-venue pipeline failures (per-venue snapshot never built
+    /// — e.g. `NoNearExpiry`, `NearStrip`). Distinct from
+    /// `per_venue_dropped` which is "snapshot built but rejected
+    /// by quality policy".
     pub per_venue_errors: Vec<(Venue, PerVenueError)>,
+    /// Per-tick outlier delta from the tracker — venues newly
+    /// dropped on this tick + venues newly restored. The scheduler
+    /// uses this for the INFO log + `volx_engine_active_venues`
+    /// gauge updates.
+    pub outlier_delta: EvalDelta,
 }
 
 impl SnapshotResult {
-    /// Strips from the first venue (alpha order on `Venue.label()`).
-    /// Used by the scheduler to populate the existing single-strip
-    /// fanout sinks until the strip-endpoint shape is extended for
-    /// multi-venue.
+    /// Strips from the first **active** venue (alpha order on
+    /// `Venue.label()`). Used by the scheduler to populate the
+    /// existing single-strip fanout sinks until the strip-endpoint
+    /// shape is extended for multi-venue.
     #[must_use]
     pub fn primary_strips(&self) -> Option<(&Strip, &Strip)> {
         self.per_venue.first().map(|v| (&v.near, &v.next))
+    }
+
+    /// Iterator over every per-venue snapshot, active + dropped.
+    /// Order: active first (alpha), then dropped (alpha).
+    pub fn all_per_venue(&self) -> impl Iterator<Item = &VenueSnapshot> {
+        self.per_venue.iter().chain(self.per_venue_dropped.iter())
     }
 }
 
@@ -192,15 +217,20 @@ impl SnapshotResult {
 ///
 /// # Panics
 ///
-/// Internal invariant: after the `per_venue.is_empty()` guard,
-/// `blend::median` on the non-empty per-venue BVOL slice cannot
-/// return `None`. An `expect()` enforces this — a panic here
-/// indicates a logic bug in the guard, never a data condition.
+/// Internal invariant: after the `per_venue.is_empty()` guard the
+/// outlier tracker's `evaluate` is called, and it guarantees the
+/// returned `active` set is non-empty (rolling back per-tick drops
+/// that would otherwise empty it — see
+/// [`crate::outlier::OutlierTracker::evaluate`]). An `expect()` on
+/// the post-partition median enforces this; a panic here indicates
+/// a logic bug in either the snapshot guard or the tracker's
+/// availability fallback, never a data condition.
 pub fn run_snapshot(
     chains: &MultiVenueChains,
     index: IndexId,
     now: OffsetDateTime,
     venues_expected: usize,
+    outlier: &mut OutlierTracker,
 ) -> Result<SnapshotResult, SnapshotError> {
     let asset = index.asset();
 
@@ -244,25 +274,49 @@ pub fn run_snapshot(
         });
     }
 
-    // Median over per-venue raw BVOLs. `per_venue` is non-empty
-    // (guarded at the `per_venue.is_empty()` check above) and
-    // `raw_values.len() == per_venue.len()`, so `blend::median`
-    // cannot return `None` here. Use `expect` rather than swallowing
-    // the invariant into a `NoVenuesLive` arm that would silently
-    // drop the real `per_venue_errors` if a future refactor broke
-    // the guard.
-    let raw_values: Vec<f64> = per_venue.iter().map(|v| v.value).collect();
-    let blended = blend::median(&raw_values)
-        .expect("per_venue is non-empty (guarded above); median cannot return None");
+    // Outlier policy (#63): drop venues whose raw BVOL has deviated
+    // > threshold from the median for `streak_required` consecutive
+    // ticks. Single-venue path is a no-op (tracker pass-through) —
+    // dropping the only live venue would be an availability
+    // decision, not a quality decision.
+    let inputs: Vec<VenueValue> = per_venue
+        .iter()
+        .map(|v| VenueValue {
+            venue: v.venue,
+            value: v.value,
+        })
+        .collect();
+    let outlier_delta = outlier.evaluate(&inputs);
 
-    let strip_hash = compute_multi_venue_strip_hash(&per_venue);
-    let confidence = confidence::score(confidence_inputs(&per_venue, venues_expected, now));
+    // Partition `per_venue` into (active, dropped). Order is
+    // preserved (alpha) within each bucket.
+    let (active_per_venue, dropped_per_venue): (Vec<_>, Vec<_>) = per_venue
+        .into_iter()
+        .partition(|v| outlier_delta.active.contains(&v.venue));
+
+    // Median over the **active** per-venue raw BVOLs. The active
+    // set is non-empty by `OutlierTracker::evaluate`'s availability
+    // guard: if the per-tick drop set would empty the active set
+    // (e.g. exactly 2 surviving venues both out-of-band), the
+    // tracker rolls back the drops for this tick and keeps every
+    // input venue active. The blend therefore always has ≥ 1
+    // input — quality is signalled via `confidence`, not by
+    // refusing to publish.
+    let active_values: Vec<f64> = active_per_venue.iter().map(|v| v.value).collect();
+    let blended = blend::median(&active_values).expect(
+        "active set is non-empty (OutlierTracker rolls back drops that would empty it); \
+         median cannot return None",
+    );
+
+    let strip_hash = compute_multi_venue_strip_hash(&active_per_venue);
+    let confidence = confidence::score(confidence_inputs(&active_per_venue, venues_expected, now));
 
     debug!(
         index_id = ?index,
         value = blended,
         confidence,
-        venues_live = per_venue.len(),
+        venues_live = active_per_venue.len(),
+        venues_dropped = dropped_per_venue.len(),
         venues_failed = per_venue_errors.len(),
         "blended snapshot computed"
     );
@@ -275,8 +329,10 @@ pub fn run_snapshot(
             strip_hash,
             ts: now,
         },
-        per_venue,
+        per_venue: active_per_venue,
+        per_venue_dropped: dropped_per_venue,
         per_venue_errors,
+        outlier_delta,
     })
 }
 
@@ -544,7 +600,7 @@ mod tests {
         let next_t = 60.0 / 365.0; // 60 days
         let chains = build_single_venue_btc_chains(near_t, next_t, 0.5);
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
-        let res = run_snapshot(&chains, IndexId::Bvol, now, 3).unwrap();
+        let res = run_snapshot(&chains, IndexId::Bvol, now, 3, &mut OutlierTracker::new()).unwrap();
         assert_eq!(res.value.index_id, IndexId::Bvol);
         // Tolerance is loose (5 vol points) because the synthetic
         // chain's wing truncation feeds into both σ² components.
@@ -577,7 +633,7 @@ mod tests {
             flat_iv_chain(100.0, 4.0, 30, 60.0 / 365.0, 0.5),
         );
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
-        match run_snapshot(&chains, IndexId::Bvol, now, 3) {
+        match run_snapshot(&chains, IndexId::Bvol, now, 3, &mut OutlierTracker::new()) {
             Err(SnapshotError::NoVenuesLive {
                 asset: Asset::Btc,
                 per_venue_errors,
@@ -597,7 +653,7 @@ mod tests {
     fn rejects_when_asset_missing_on_every_venue() {
         let chains: MultiVenueChains = HashMap::new();
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
-        match run_snapshot(&chains, IndexId::Bvol, now, 3) {
+        match run_snapshot(&chains, IndexId::Bvol, now, 3, &mut OutlierTracker::new()) {
             Err(SnapshotError::MissingAsset(Asset::Btc)) => {}
             other => panic!("expected MissingAsset(Btc), got {other:?}"),
         }
@@ -638,8 +694,8 @@ mod tests {
     fn strip_hash_is_deterministic() {
         let chains = build_single_venue_btc_chains(14.0 / 365.0, 60.0 / 365.0, 0.5);
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
-        let a = run_snapshot(&chains, IndexId::Bvol, now, 3).unwrap();
-        let b = run_snapshot(&chains, IndexId::Bvol, now, 3).unwrap();
+        let a = run_snapshot(&chains, IndexId::Bvol, now, 3, &mut OutlierTracker::new()).unwrap();
+        let b = run_snapshot(&chains, IndexId::Bvol, now, 3, &mut OutlierTracker::new()).unwrap();
         assert_eq!(a.value.strip_hash, b.value.strip_hash);
     }
 
@@ -648,8 +704,22 @@ mod tests {
         let chains_lo = build_single_venue_btc_chains(14.0 / 365.0, 60.0 / 365.0, 0.4);
         let chains_hi = build_single_venue_btc_chains(14.0 / 365.0, 60.0 / 365.0, 0.5);
         let now = time::macros::datetime!(2026-05-25 12:00:00 UTC);
-        let a = run_snapshot(&chains_lo, IndexId::Bvol, now, 3).unwrap();
-        let b = run_snapshot(&chains_hi, IndexId::Bvol, now, 3).unwrap();
+        let a = run_snapshot(
+            &chains_lo,
+            IndexId::Bvol,
+            now,
+            3,
+            &mut OutlierTracker::new(),
+        )
+        .unwrap();
+        let b = run_snapshot(
+            &chains_hi,
+            IndexId::Bvol,
+            now,
+            3,
+            &mut OutlierTracker::new(),
+        )
+        .unwrap();
         assert_ne!(a.value.strip_hash, b.value.strip_hash);
     }
 

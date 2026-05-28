@@ -28,6 +28,7 @@
 //! `SET … NX EX 60` keyed on `(index_id, bar)`) belongs to a
 //! follow-up hardening PR; not in scope for #20.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -39,7 +40,12 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use volx_shared_types::ids::IndexId;
 
-use volx_engine::{chain, sinks::IndexSinks, snapshot};
+use volx_engine::{
+    chain,
+    outlier::{DEFAULT_STREAK_REQUIRED, DEFAULT_THRESHOLD_PCT, OutlierTracker},
+    sinks::IndexSinks,
+    snapshot,
+};
 
 /// Recompute cadence per `METHODOLOGY.md` §5.
 const TICK_INTERVAL: Duration = Duration::from_secs(60);
@@ -66,14 +72,37 @@ async fn main() -> Result<()> {
     let clickhouse_db = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "volx".into());
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let venues_expected = parse_venues_expected_env();
+    let outlier_threshold_pct =
+        parse_f64_env("ENGINE_OUTLIER_THRESHOLD_PCT", DEFAULT_THRESHOLD_PCT, |v| {
+            v > 0.0 && v < 1.0
+        });
+    let outlier_streak =
+        parse_u32_env("ENGINE_OUTLIER_STREAK", DEFAULT_STREAK_REQUIRED, |v| v >= 1);
 
     info!(
         version = volx_shared_types::METHODOLOGY_VERSION,
         clickhouse = %clickhouse_url,
         redis = %redis_url,
         venues_expected,
+        outlier_threshold_pct,
+        outlier_streak,
         "volx-engine starting"
     );
+
+    // Per-index outlier trackers, owned by the scheduler loop so
+    // streak counts persist across the 60 s cadence (the 5-tick
+    // rule is the whole point). One tracker per published index so
+    // a streak on BVOL does not bleed into EVOL.
+    let mut outliers: HashMap<IndexId, OutlierTracker> = HashMap::from([
+        (
+            IndexId::Bvol,
+            OutlierTracker::with_thresholds(outlier_threshold_pct, outlier_streak),
+        ),
+        (
+            IndexId::Evol,
+            OutlierTracker::with_thresholds(outlier_threshold_pct, outlier_streak),
+        ),
+    ]);
 
     // Reader client (the chain query side). Kept separate from the
     // sinks' writer client so the read pool doesn't share max-conn
@@ -103,21 +132,88 @@ async fn main() -> Result<()> {
             }
             _ = ticker.tick() => {
                 let now = OffsetDateTime::now_utc();
-                run_tick(&reader, &mut sinks, now, venues_expected).await;
+                run_tick(
+                    &reader,
+                    &mut sinks,
+                    now,
+                    venues_expected,
+                    &mut outliers,
+                ).await;
             }
         }
     }
 }
 
-/// Resolve `ENGINE_VENUES_EXPECTED` with loud failure modes:
-///
-/// - Unset → silent default (3).
-/// - Parse failure → `warn!` and fall back to default, so an
-///   operator chasing an unexpected confidence value has a log line
-///   instead of silence.
-/// - `0` → accepted but `warn!`-ed, because it disables the
-///   `venue_term` of the confidence score entirely (see
-///   `confidence::score` docs).
+/// Cast the active-venue count for the Prometheus gauge. usize → f64
+/// truncates above 2^53, which is wildly more venues than the engine
+/// will ever see — the cast is lossless for any practical value.
+#[allow(clippy::cast_precision_loss)]
+fn active_venues_gauge_value(n: usize) -> f64 {
+    n as f64
+}
+
+/// Parse a positive `f64` env var with a validity predicate. Logs +
+/// falls back to default on parse failure or out-of-range, same posture
+/// as [`parse_venues_expected_env`].
+fn parse_f64_env(key: &str, default: f64, valid: impl Fn(f64) -> bool) -> f64 {
+    let Some(raw) = std::env::var(key).ok() else {
+        return default;
+    };
+    match raw.parse::<f64>() {
+        Ok(v) if valid(v) => v,
+        Ok(v) => {
+            warn!(
+                key = key,
+                raw = %raw,
+                parsed = v,
+                default,
+                "env var out of valid range; using default"
+            );
+            default
+        }
+        Err(e) => {
+            warn!(
+                key = key,
+                raw = %raw,
+                error = %e,
+                default,
+                "env var is not a valid f64; using default"
+            );
+            default
+        }
+    }
+}
+
+/// Parse a `u32` env var with a validity predicate.
+fn parse_u32_env(key: &str, default: u32, valid: impl Fn(u32) -> bool) -> u32 {
+    let Some(raw) = std::env::var(key).ok() else {
+        return default;
+    };
+    match raw.parse::<u32>() {
+        Ok(v) if valid(v) => v,
+        Ok(v) => {
+            warn!(
+                key = key,
+                raw = %raw,
+                parsed = v,
+                default,
+                "env var out of valid range; using default"
+            );
+            default
+        }
+        Err(e) => {
+            warn!(
+                key = key,
+                raw = %raw,
+                error = %e,
+                default,
+                "env var is not a valid u32; using default"
+            );
+            default
+        }
+    }
+}
+
 fn parse_venues_expected_env() -> usize {
     let Some(raw) = std::env::var("ENGINE_VENUES_EXPECTED").ok() else {
         return DEFAULT_VENUES_EXPECTED;
@@ -145,11 +241,13 @@ fn parse_venues_expected_env() -> usize {
 }
 
 /// Pull chains, run every index, publish or count-the-rejection.
+#[allow(clippy::too_many_lines)] // each branch is a distinct metric/log block; splitting would scatter the per-tick contract
 async fn run_tick(
     reader: &ChClient,
     sinks: &mut IndexSinks,
     now: OffsetDateTime,
     venues_expected: usize,
+    outliers: &mut HashMap<IndexId, OutlierTracker>,
 ) {
     let chains = match chain::fetch_chains(reader, now).await {
         Ok(c) => c,
@@ -163,7 +261,10 @@ async fn run_tick(
 
     for index in [IndexId::Bvol, IndexId::Evol] {
         let ticker = index.ticker();
-        match snapshot::run_snapshot(&chains, index, now, venues_expected) {
+        let tracker = outliers
+            .get_mut(&index)
+            .expect("outliers map seeded with both Bvol + Evol at startup");
+        match snapshot::run_snapshot(&chains, index, now, venues_expected, tracker) {
             Ok(res) => {
                 // Per-venue rejection counter is observability for the
                 // partial-survivor case — the blended publish below
@@ -177,6 +278,40 @@ async fn run_tick(
                     )
                     .increment(1);
                 }
+                // Outlier drop / restore transitions — INFO log per
+                // event so operators can grep for "venue X dropped"
+                // in the JSON log stream, plus an `active_venues`
+                // gauge they can dashboard.
+                for d in &res.outlier_delta.newly_dropped {
+                    info!(
+                        index_id = ticker,
+                        venue = d.venue.label(),
+                        venue_value = d.value,
+                        median = res.outlier_delta.median,
+                        deviation_pct = d.deviation_pct,
+                        streak = d.streak,
+                        "venue dropped by outlier policy"
+                    );
+                    metrics::counter!(
+                        "volx_engine_outlier_drops_total",
+                        "index_id" => ticker.to_owned(),
+                        "venue" => d.venue.label(),
+                    )
+                    .increment(1);
+                }
+                for venue in &res.outlier_delta.newly_restored {
+                    info!(
+                        index_id = ticker,
+                        venue = venue.label(),
+                        median = res.outlier_delta.median,
+                        "venue restored to outlier-active set"
+                    );
+                }
+                metrics::gauge!(
+                    "volx_engine_active_venues",
+                    "index_id" => ticker.to_owned(),
+                )
+                .set(active_venues_gauge_value(res.per_venue.len()));
                 // Use the first per-venue strip pair (alpha-sorted on
                 // Venue.label()) for the `last_strip` fanout. The
                 // strip-endpoint shape (#23) keeps a single near/next
@@ -205,6 +340,7 @@ async fn run_tick(
                         value = res.value.value,
                         confidence = res.value.confidence,
                         venues_live = res.per_venue.len(),
+                        venues_dropped = res.per_venue_dropped.len(),
                         venues_failed = res.per_venue_errors.len(),
                         "snapshot published"
                     );

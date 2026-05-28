@@ -16,6 +16,7 @@ use volx_shared_types::units::Years;
 
 use volx_engine::chain::{AssetChains, MultiVenueChains, VenueChains};
 use volx_engine::confidence::METHODOLOGY_MIN_STRIKES;
+use volx_engine::outlier::OutlierTracker;
 use volx_engine::strip::{ChainLeg, ExpiryChain};
 use volx_engine::{SnapshotError, bs};
 
@@ -118,7 +119,9 @@ fn three_venues_all_fresh_full_strikes_yields_one() {
     for v in [Venue::Bybit, Venue::Deribit, Venue::Okx] {
         chains.insert(v, venue_with_freshness(now(), 0.5));
     }
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+            .unwrap();
     assert_eq!(res.value.confidence, 1.0);
 }
 
@@ -128,7 +131,9 @@ fn two_of_three_venues_yields_two_thirds() {
     let mut chains: MultiVenueChains = HashMap::new();
     chains.insert(Venue::Deribit, venue_with_freshness(now(), 0.5));
     chains.insert(Venue::Okx, venue_with_freshness(now(), 0.5));
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+            .unwrap();
     assert!(
         (res.value.confidence - 2.0 / 3.0).abs() < 1e-12,
         "expected ≈ 0.667, got {}",
@@ -141,7 +146,9 @@ fn single_venue_yields_one_third() {
     // venue_term = 1/3, fresh = 1, strike = 1 → ≈ 0.333.
     let mut chains: MultiVenueChains = HashMap::new();
     chains.insert(Venue::Deribit, venue_with_freshness(now(), 0.5));
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+            .unwrap();
     assert!(
         (res.value.confidence - 1.0 / 3.0).abs() < 1e-12,
         "expected ≈ 0.333, got {}",
@@ -159,7 +166,9 @@ fn stale_quotes_demote_confidence_via_fresh_term() {
     chains.insert(Venue::Bybit, venue_with_freshness(fresh, 0.5));
     chains.insert(Venue::Deribit, venue_with_freshness(stale, 0.5));
     chains.insert(Venue::Okx, venue_with_freshness(fresh, 0.5));
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+            .unwrap();
     assert!(
         (res.value.confidence - 0.5).abs() < 1e-12,
         "expected ≈ 0.5, got {}",
@@ -178,7 +187,9 @@ fn quote_age_beyond_budget_collapses_confidence_to_zero() {
     chains.insert(Venue::Deribit, venue_with_freshness(very_stale, 0.5));
     chains.insert(Venue::Okx, venue_with_freshness(fresh, 0.5));
     chains.insert(Venue::Bybit, venue_with_freshness(fresh, 0.5));
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+            .unwrap();
     assert_eq!(res.value.confidence, 0.0);
     // Sanity: the snapshot still published a value (confidence is
     // not a publish gate).
@@ -193,7 +204,9 @@ fn thin_strip_reduces_confidence_linearly() {
     // 1/3 * 0.75 = 0.25.
     let mut chains: MultiVenueChains = HashMap::new();
     chains.insert(Venue::Deribit, venue_with_listed_count(now(), 0.5, 6));
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+            .unwrap();
     #[allow(clippy::cast_precision_loss)] // METHODOLOGY_MIN_STRIKES = 8, lossless in f64
     let expected = (1.0 / 3.0) * (6.0 / METHODOLOGY_MIN_STRIKES as f64);
     assert!(
@@ -215,7 +228,9 @@ fn confidence_always_in_unit_interval() {
             venue_with_listed_count(now(), 0.5, METHODOLOGY_MIN_STRIKES * 4),
         );
     }
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 1).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 1, &mut OutlierTracker::new())
+            .unwrap();
     assert!((0.0..=1.0).contains(&res.value.confidence));
     assert_eq!(res.value.confidence, 1.0);
 }
@@ -229,7 +244,9 @@ fn venues_expected_env_dialed_down_during_rollout() {
     let mut chains: MultiVenueChains = HashMap::new();
     chains.insert(Venue::Deribit, venue_with_freshness(now(), 0.5));
     chains.insert(Venue::Okx, venue_with_freshness(now(), 0.5));
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 2).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 2, &mut OutlierTracker::new())
+            .unwrap();
     assert_eq!(res.value.confidence, 1.0);
 }
 
@@ -239,7 +256,7 @@ fn missing_asset_does_not_carry_confidence() {
     // Confidence is a property of the published row; an unpublished
     // tick has no confidence to assert against.
     let chains: MultiVenueChains = HashMap::new();
-    match volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3) {
+    match volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new()) {
         Err(SnapshotError::MissingAsset(Asset::Btc)) => {}
         other => panic!("expected MissingAsset(Btc), got {other:?}"),
     }
