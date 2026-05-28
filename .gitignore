@@ -1,7 +1,9 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS committed for this workspace: every crate ships as a
+# binary (ingestion, engine) and reproducible Docker builds require
+# the lockfile in CI. Libraries omit it; binaries commit it.
 
 # Go
 /api/bin/
