@@ -327,7 +327,7 @@ docker compose -f docker/docker-compose.yml up --build
 First build is ~5–10 min (cargo-chef warming the dep cache); subsequent
 builds skip the warm cache and finish in seconds. After ~120 s:
 
-- `curl localhost:8080/v1/index/bvol/latest` returns a populated payload.
+- `curl 127.0.0.1:8090/v1/index/bvol/latest` returns a populated payload.
 - `curl localhost:9100/metrics` and `localhost:9101/metrics` expose the
   ingestion + engine Prometheus surfaces.
 

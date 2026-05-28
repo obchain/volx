@@ -192,7 +192,9 @@ services:
       # as the Rust services above.
       API_BIND: "0.0.0.0:8080"
     ports:
-      - "127.0.0.1:8080:8080"
+      # Host 8090 → container 8080. Host 8080 conflicts with another
+      # local listener (aether-monitor); keep VolX off it.
+      - "127.0.0.1:8090:8080"
     healthcheck:
       # The Go distroless/static image still has no shell, but it
       # ships with `wget` available via busybox-style multicall on
