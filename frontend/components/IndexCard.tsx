@@ -80,7 +80,7 @@ export function IndexCard({ id, liveTick, initialValue, initialTs, history }: In
     <Link
       ref={ref}
       href={`/chart/${id}`}
-      className="group volx-glow-card relative block overflow-hidden rounded-2xl border border-border-subtle bg-surface p-7 transition-all hover:border-accent/40 hover:bg-surface-2 hover:shadow-[0_8px_32px_-12px_var(--accent-glow)]"
+      className="group volx-glow-card volx-card relative block overflow-hidden rounded-2xl border border-border-subtle bg-surface-elev p-7 transition-all hover:border-accent/40 hover:bg-surface-2 hover:shadow-[0_8px_32px_-12px_var(--accent-glow)]"
     >
       {/* Cursor-tracking accent glow layer */}
       <span aria-hidden className="volx-glow-layer" />

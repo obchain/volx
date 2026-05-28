@@ -552,7 +552,7 @@ export function Chart({ id }: ChartProps) {
         </div>
       </section>
 
-      <section className="mt-5 grid grid-cols-2 gap-3 rounded-xl border border-border-subtle bg-surface p-4 sm:grid-cols-3 md:grid-cols-6">
+      <section className="volx-card mt-5 grid grid-cols-2 gap-3 rounded-xl border border-border-subtle bg-surface-elev p-4 sm:grid-cols-3 md:grid-cols-6">
         <Stat label="open" value={stats?.open?.toFixed(2)} />
         <Stat label="close" value={stats?.close?.toFixed(2)} />
         <Stat label="high" value={stats?.high?.toFixed(2)} />
@@ -584,7 +584,7 @@ export function Chart({ id }: ChartProps) {
               {TIMEFRAME_SPEC[timeframe].interval} bars
             </span>
           </div>
-          <div className="relative overflow-hidden rounded-2xl border border-border-subtle bg-surface">
+          <div className="volx-card relative overflow-hidden rounded-2xl border border-border-subtle bg-surface-elev">
             <div
               ref={containerRef}
               className="aspect-[16/9] w-full min-h-[420px] xl:aspect-[21/9] xl:min-h-[560px]"
@@ -674,7 +674,7 @@ function Stat({ label, value }: { label: string; value?: string }) {
 
 function RailCard({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-xl border border-border-subtle bg-surface p-4">
+    <div className="volx-card rounded-xl border border-border-subtle bg-surface-elev p-4">
       <h3 className="mb-3 text-[10px] uppercase tracking-widest text-soft">{title}</h3>
       <div className="flex flex-col gap-1.5">{children}</div>
     </div>

@@ -51,7 +51,7 @@ export function TrustStrip() {
         {CARDS.map((c) => (
           <article
             key={c.k}
-            className="flex flex-col gap-3 rounded-2xl border border-border-subtle bg-surface p-6 transition-colors hover:border-accent/40"
+            className="volx-card flex flex-col gap-3 rounded-2xl border border-border-subtle bg-surface-elev p-6 transition-colors hover:border-accent/40"
           >
             <span className="text-[10px] font-medium uppercase tracking-[0.18em] text-accent">
               {c.k}
