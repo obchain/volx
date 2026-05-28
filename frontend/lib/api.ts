@@ -6,16 +6,16 @@
 //
 // - REST always uses a same-origin relative path (`/v1/...`). The Next
 //   dev/prod server rewrites that to the Go API target — see
-//   `next.config.ts` (`API_PROXY_TARGET`, default `http://localhost:8080`).
+//   `next.config.ts` (`API_PROXY_TARGET`, default `http://127.0.0.1:8090`).
 //   No CORS plumbing needed.
 //
 // - WebSocket cannot ride the rewrite (the upgrade handshake bypasses
 //   the rewrite layer) and connects directly. The host is configurable
-//   via `NEXT_PUBLIC_API_BASE`, default `http://localhost:8080`. If the
+//   via `NEXT_PUBLIC_API_BASE`, default `http://127.0.0.1:8090`. If the
 //   API is reachable on a non-default host, both `API_PROXY_TARGET`
 //   (build-time, server) and `NEXT_PUBLIC_API_BASE` (build-time, public)
 //   must point at it.
-const WS_API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8080";
+const WS_API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8090";
 
 export const WS_URL = `${WS_API_BASE.replace(/^http/, "ws")}/v1/stream`;
 
