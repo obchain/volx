@@ -85,6 +85,124 @@ services:
       retries: 12
       start_period: 5s
 
+  # ─── Application services (issue #64) ────────────────────────────────
+  #
+  # Three binaries cover the full pipeline:
+  # - ingestion:  WS connectors (Deribit + OKX + Bybit, in one process)
+  #               + normalizer (in-process library) → ClickHouse + Redis
+  # - engine:     60 s scheduler → per-venue strip + median blend +
+  #               confidence + outlier drop → index_ticks + Redis
+  # - api:        Go REST + WS surface for the published index
+  #
+  # The normalizer is a Rust library consumed by the ingestion binary,
+  # not a separate service — splitting it would force a flume-channel
+  # serialization layer for no operational benefit on a single host.
+  #
+  # `context: ..` everywhere because the Rust workspace lives at the
+  # repo root and the per-crate Dockerfiles need to see Cargo.toml +
+  # crates/* to feed cargo-chef.
+  ingestion:
+    build:
+      context: ..
+      dockerfile: crates/ingestion/Dockerfile
+    container_name: volx-ingestion
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_URL: "http://clickhouse:8123"
+      CLICKHOUSE_DB: "volx"
+      REDIS_URL: "redis://redis:6379"
+      # Bind 0.0.0.0 so the Prometheus port published to the host
+      # works. The localhost-only default is the right posture on a
+      # dev box; inside a private compose network the all-interfaces
+      # bind is safe.
+      METRICS_BIND: "0.0.0.0:9100"
+      RUST_LOG: "info,volx_ingestion=info,volx_normalizer=info"
+    ports:
+      - "127.0.0.1:9100:9100"
+    healthcheck:
+      # distroless/cc has no shell, no curl, no wget — the binary's
+      # Prometheus exporter is the only network surface we can probe.
+      # An HTTP GET against /metrics from a sibling temporary
+      # container is the canonical pattern, but compose healthchecks
+      # run inside the target container. Fall back to a TCP probe
+      # via `nc` from an init-style sidecar would over-complicate
+      # this; keep healthcheck off the distroless services and let
+      # `depends_on` use the storage layer's healthchecks. The Go
+      # API does its own /v1/health probe.
+      disable: true
+
+  engine:
+    build:
+      context: ..
+      dockerfile: crates/engine/Dockerfile
+    container_name: volx-engine
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Soft-depend on ingestion: the engine's chain query returns
+      # empty until ingestion has written rows. The engine handles
+      # empty cleanly (logs `MissingAsset`) so this is best-effort,
+      # not a strict gate.
+      ingestion:
+        condition: service_started
+    environment:
+      CLICKHOUSE_URL: "http://clickhouse:8123"
+      CLICKHOUSE_DB: "volx"
+      REDIS_URL: "redis://redis:6379"
+      METRICS_BIND: "0.0.0.0:9101"
+      ENGINE_VENUES_EXPECTED: "3"
+      RUST_LOG: "info,volx_engine=info"
+    ports:
+      - "127.0.0.1:9101:9101"
+    healthcheck:
+      disable: true
+
+  api:
+    build:
+      context: ..
+      dockerfile: api/Dockerfile
+    container_name: volx-api
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # The Go driver (`clickhouse-go/v2`) speaks the **native TCP
+      # protocol on port 9000**, not HTTP — distinct from the Rust
+      # `clickhouse` crate which talks HTTP on 8123. Same database,
+      # two ports; mismatched env vars here would silently fall
+      # back to `127.0.0.1:9000` (loopback inside the api container)
+      # and refuse to start. The clickhouse service exposes 9000
+      # on the compose network so inter-container traffic resolves
+      # `clickhouse:9000` natively.
+      CLICKHOUSE_DSN: "clickhouse://default@clickhouse:9000?dial_timeout=2s"
+      CLICKHOUSE_DB: "volx"
+      REDIS_URL: "redis://redis:6379"
+      # Bind all-interfaces so the published port works; same posture
+      # as the Rust services above.
+      API_BIND: "0.0.0.0:8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      # The Go distroless/static image still has no shell, but it
+      # ships with `wget` available via busybox-style multicall on
+      # gcr.io/distroless/static? No — `static` is truly minimal.
+      # The fiber `/v1/health` endpoint is exposed; we probe it from
+      # *outside* via the host port. Inside the container we have
+      # only the binary itself. Disable the healthcheck and rely on
+      # the operator's `curl localhost:8080/v1/health` from the host.
+      disable: true
+
 volumes:
   # Named volumes so `docker compose down` (without `-v`) preserves data
   # across restarts. Wipe with `docker compose down -v` when needed.
