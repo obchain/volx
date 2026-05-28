@@ -246,7 +246,7 @@ export default function MethodologyPage() {
             {SECTIONS.map((s) => (
               <article
                 key={s.k}
-                className="grid grid-cols-12 gap-6 rounded-2xl border border-border-subtle bg-surface px-7 py-6 transition-colors hover:border-accent/30"
+                className="volx-card grid grid-cols-12 gap-6 rounded-2xl border border-border-subtle bg-surface-elev px-7 py-6 transition-colors hover:border-accent/30"
               >
                 <div className="col-span-12 flex items-baseline gap-3 sm:col-span-3 sm:flex-col sm:gap-2">
                   <span className="font-mono text-2xl font-semibold text-accent">{s.k}</span>
@@ -264,7 +264,7 @@ export default function MethodologyPage() {
 
         {/* CTA */}
         <section className="mx-auto w-full max-w-4xl px-6 pb-20">
-          <div className="flex flex-col items-center gap-4 rounded-2xl border border-border-subtle bg-surface px-8 py-10 text-center">
+          <div className="volx-card flex flex-col items-center gap-4 rounded-2xl border border-border-subtle bg-surface-elev px-8 py-10 text-center">
             <h3 className="max-w-md text-2xl font-semibold tracking-tight">
               Audit it. Run it locally.
             </h3>

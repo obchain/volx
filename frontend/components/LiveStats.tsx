@@ -42,7 +42,7 @@ export function LiveStats() {
 
   return (
     <section className="mx-auto w-full max-w-5xl px-6">
-      <div className="grid grid-cols-2 gap-6 rounded-2xl border border-border-subtle bg-surface px-8 py-6 sm:grid-cols-4">
+      <div className="volx-card grid grid-cols-2 gap-6 rounded-2xl border border-border-subtle bg-surface-elev px-8 py-6 sm:grid-cols-4">
         <Stat k="venues" v="3" hint="deribit · okx · bybit" />
         <Stat k="cadence" v="60s" hint="every minute" />
         <Stat k="tenor" v="30d" hint="constant maturity" />

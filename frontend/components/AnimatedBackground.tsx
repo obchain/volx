@@ -64,35 +64,48 @@ export function AnimatedBackground() {
         .volx-blob {
           position: absolute;
           border-radius: 9999px;
-          filter: blur(80px);
-          opacity: 0.55;
+          filter: blur(90px);
           will-change: transform;
         }
         .volx-blob-1 {
-          width: 520px;
-          height: 520px;
-          left: -120px;
-          top: -120px;
+          width: 560px;
+          height: 560px;
+          left: -140px;
+          top: -140px;
           background: var(--accent);
+          opacity: 0.42;
           animation: volx-drift-1 28s ease-in-out infinite alternate;
         }
         .volx-blob-2 {
-          width: 600px;
-          height: 600px;
-          right: -150px;
-          top: 80px;
-          background: var(--up);
-          opacity: 0.28;
+          width: 640px;
+          height: 640px;
+          right: -180px;
+          top: 60px;
+          background: var(--accent-2);
+          opacity: 0.34;
           animation: volx-drift-2 34s ease-in-out infinite alternate;
         }
         .volx-blob-3 {
-          width: 480px;
-          height: 480px;
+          width: 520px;
+          height: 520px;
           left: 40%;
-          top: 380px;
-          background: var(--accent-strong);
-          opacity: 0.18;
+          top: 360px;
+          background: var(--accent-3);
+          opacity: 0.22;
           animation: volx-drift-3 42s ease-in-out infinite alternate;
+        }
+        /* Dark theme: tone every blob down so the navy reads as the
+           canvas not a coloured field. Light theme uses the brighter
+           defaults above — the pearl canvas can carry more saturation
+           without the foreground losing contrast. */
+        :global([data-theme="dark"]) .volx-blob-1 {
+          opacity: 0.5;
+        }
+        :global([data-theme="dark"]) .volx-blob-2 {
+          opacity: 0.22;
+        }
+        :global([data-theme="dark"]) .volx-blob-3 {
+          opacity: 0.16;
         }
 
         @keyframes volx-drift-1 {
