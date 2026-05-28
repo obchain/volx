@@ -21,6 +21,8 @@
 - [Indices published](#indices-published)
 - [How it works](#how-it-works)
 - [Methodology in one screen](#methodology-in-one-screen)
+- [Multi-venue robustness](#multi-venue-robustness)
+- [Confidence score](#confidence-score)
 - [Architecture](#architecture)
 - [Tech stack](#tech-stack)
 - [Quickstart](#quickstart)
@@ -156,6 +158,86 @@ would add operational surface without measurable accuracy gain).
 
 ---
 
+## Multi-venue robustness
+
+VolX ingests options data from **three venues** — Deribit, OKX, and Bybit
+— and blends them into a single published number per asset.
+
+### Per-venue strip + median blend
+
+Each 60-second snapshot is run **independently per venue**: the engine
+builds a complete strip and computes a venue-local σ²₃₀d for each of the
+three sources. The three values are then combined by taking the **median**
+(not the mean) — so a single bad venue cannot drag the published index.
+For two surviving venues the median collapses to the simple mean of the
+two; for one surviving venue the index passes the single value through
+unchanged.
+
+The wire-format index hash (`strip_hash`) is a content-hash over the
+multi-venue strip set, separator-delimited per venue, so any historical
+index value can be reproduced bit-for-bit from the raw tick archive.
+
+### Outlier drop policy
+
+If a venue's σ²₃₀d deviates from the cross-venue median by more than
+**5 %** for **5 consecutive 60-second ticks** (5 minutes), the engine
+**drops that venue** and recomputes on the remaining two until the venue's
+quotes return to consensus. Constants live in `crates/engine/src/outlier.rs`:
+
+```
+DEFAULT_THRESHOLD_PCT   = 0.05        // 5%
+DEFAULT_STREAK_REQUIRED = 5           // ticks
+```
+
+**Availability rollback.** If the drop would leave the active set empty
+(e.g. all three venues simultaneously diverging) the policy reverts: every
+venue is kept active and the lower confidence score (see below) signals
+the degraded state to downstream consumers. The system never publishes a
+`null` for a transient quorum collapse.
+
+Per-venue drops and restorations are surfaced via two Prometheus metrics:
+- `volx_engine_active_venues{index}` — gauge, current count.
+- `volx_engine_outlier_drops_total{index, venue, action="drop"|"restore"}`
+  — counter, monotonic over the engine's lifetime.
+
+### Why three venues, not two
+
+Volmex BVIV/EVIV blends two venues (Deribit + OKX). With only two sources
+no real outlier policy is possible — drop one and you are a single-venue
+index. VolX's third venue (Bybit) is **specifically what makes the
+5%/5-tick drop policy viable**: when one venue diverges, the remaining
+two still constitute a quorum and the median is well-defined.
+
+---
+
+## Confidence score
+
+Every published index tick carries a **`confidence ∈ [0.0, 1.0]`** value
+computed from three multiplied factors:
+
+```
+confidence = venue_factor × freshness_factor × strike_factor
+```
+
+| Factor | Definition |
+| --- | --- |
+| `venue_factor` | `venues_live / venues_expected` (e.g. 2/3 = 0.667 if one venue is dropped) |
+| `freshness_factor` | `max(0, 1 − max_quote_age / FRESH_BUDGET_S)`, `FRESH_BUDGET_S = 60` |
+| `strike_factor` | `min(1, strip_strikes / METHODOLOGY_MIN_STRIKES)`, `METHODOLOGY_MIN_STRIKES = 8` |
+
+A perfect snapshot (3/3 venues, all quotes fresh, ≥ 8 strikes) yields
+`confidence = 1.0`. Any degradation in venue coverage, quote freshness, or
+strike depth pulls the score below 1.0 — proportionally and
+multiplicatively, so two simultaneous degradations compound rather than
+mask each other.
+
+The score is published alongside every index tick (`index_ticks.confidence`
+column + REST `/v1/index/{symbol}/latest` payload + WebSocket frames) so
+downstream consumers can filter, gate, or weight by it. Implementation
+lives in `crates/engine/src/confidence.rs`.
+
+---
+
 ## Architecture
 
 ```
@@ -178,11 +260,14 @@ would add operational surface without measurable accuracy gain).
                 ┌──────────────────────────────────────────────────────┐
                 │                   engine (60s cron)                  │
                 │   ① snapshot all venues                              │
-                │   ② strip builder (forward via parity, K₀, OTM Q(K)) │
+                │   ② per-venue strip (forward via parity, K₀, OTM Q)  │
                 │   ③ fitted-IV spline + dense-grid resample           │
-                │   ④ Carr-Madan variance integral                     │
-                │   ⑤ 30-day total-variance interpolation              │
-                │   ⑥ publish IndexValue { value, confidence, hash }   │
+                │   ④ Carr-Madan variance integral, per venue          │
+                │   ⑤ 30-day total-variance interpolation, per venue   │
+                │   ⑥ median blend across venues                       │
+                │   ⑦ outlier drop (5% · 5-tick streak · rollback)     │
+                │   ⑧ confidence = venue × freshness × strikes         │
+                │   ⑨ publish IndexValue { value, confidence, hash }   │
                 └──────────────────────┬───────────────────────────────┘
                                        │ index_ticks
                                        ▼
@@ -209,12 +294,12 @@ publish — well under the 60 s cadence, even at M2 multi-venue load.
 
 | Layer | Tech | Why |
 | --- | --- | --- |
-| Ingestion + engine + normalizer | **Rust 1.85** (edition 2024) | `f64` determinism, zero-allocation tick paths, no GC pauses inside the 60 s loop |
+| Ingestion + engine + normalizer | **Rust 1.89** (edition 2024, resolver 3) | `f64` determinism, zero-allocation tick paths, no GC pauses inside the 60 s loop |
 | Async runtime | `tokio` + `tokio-tungstenite` (rustls) | mature WS stack; rustls avoids OpenSSL on Oracle Cloud |
 | In-process channel | `flume` | bounded MPSC, no `std::sync::mpsc` allocation overhead |
 | Storage (ticks + index) | **ClickHouse 24.x** | 15-20× compression on option ticks; sub-second range scans |
 | Cache + pubsub | **Redis 7** | hot latest-value reads + WS fanout |
-| API | **Go 1.23** + Fiber v3 + gorilla/websocket + prometheus/client_golang | fast HTTP, mature WS, low ops surface |
+| API | **Go 1.25** + Fiber v3 + gorilla/websocket + prometheus/client_golang | fast HTTP, mature WS, low ops surface |
 | Frontend | **Next.js 15** (app router) + React 19 + Tailwind 4 + `lightweight-charts` | static-friendly, deterministic chart rendering |
 | Research | Python 3.14 + numpy + pandas + scipy + matplotlib + jupyter | the methodology was validated here before any Rust was written |
 | Lint policy | `unsafe_code = forbid`, clippy pedantic, `cargo fmt --check` | financial code; zero tolerance for memory bugs |
@@ -515,15 +600,27 @@ M3    Methodology page, aggregator submissions, public launch
 
 ## Comparison to alternatives
 
-| Property | **VolX** | Deribit DVOL | T3 / Volmex | Discontinued BVIX |
-| --- | --- | --- | --- | --- |
-| Methodology public | ✓ (full spec) | partial whitepaper | proprietary | yes |
-| Computed from public data | ✓ | ✓ (Deribit-only) | proprietary feeds | CBOE-licensed |
-| Self-hostable | ✓ | ✗ | ✗ | ✗ |
-| Free historical access | ✓ (planned) | partial (rate-limited) | paid | n/a |
-| Determinism guarantee | ✓ (bit-for-bit) | implicit | unknown | n/a |
-| Multi-venue blending | M2 | Deribit only | yes (paid) | n/a |
-| Cost | $0 | $0 (read) / paid (commercial) | paid | discontinued |
+| Dimension | **VolX** | Deribit DVOL | Volmex BVIV / EVIV |
+| --- | --- | --- | --- |
+| Operator | Open-source / self-hosted | Deribit (exchange) | Volmex Finance |
+| Live since | 2026 (in validation) | 2021 | 2022 |
+| Assets | BTC + ETH | BTC | BTC, ETH, multi-asset (MVIV) |
+| Tenor | 30-day | 30-day | Full term structure (1D / 7D / 14D / 30D / 60D / 90D / 180D) |
+| Number of venues | **3** | 1 | 2 |
+| Venues used | Deribit, OKX, Bybit | Deribit | Deribit, OKX |
+| Blending method | **Per-venue strip + median** | n/a (single venue) | Aggregated quote universe |
+| Outlier rejection | **5 % deviation · 5-tick streak · quorum rollback** | n/a | None published (cannot drop with only 2 venues) |
+| Per-tick confidence score | **Yes (venue × freshness × strikes)** | — | — |
+| Update frequency | 60 s | 1 s | 1 s |
+| Methodology base | Cboe VIX (2003) | Cboe VIX (2003) | Cboe VIX (2003) |
+| Methodology published | **Full spec + every deviation documented** | Yes (whitepaper) | Yes (overview) |
+| Source code public | **Yes — permissive licence** | No | No |
+| Self-hostable | **Yes — `docker compose up`** | No | No |
+| Data feed cost | **$0 (public exchange WS)** | $0 (Deribit public REST/WS) | Free public tier · paid institutional feed |
+| Determinism guarantee | **Bit-for-bit (`|Δσ²_30d| < 1e-6`)** | Implicit | Unknown |
+| Trading product (perp futures) | n/a (research / reference) | Trades on Deribit itself | BVIV / EVIV perps on Bitfinex, gTrade, Polymarket |
+| Best-known strength | **Robustness · transparency · self-hostability** | Liquidity-weighted single-venue truth · simplest methodology | Multi-tenor term structure · tradable perpetuals |
+| Best-known weakness | Newer · not battle-tested · 30-day validation still pending | Single point of failure (only Deribit data) | Cannot outlier-drop with only 2 venues · methodology not fully public |
 
 VolX is positioned as the **reproducible, auditable, free baseline** that
 crypto-native projects, researchers, and risk teams can wire into any
