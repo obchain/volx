@@ -605,8 +605,8 @@ export function Chart({ id }: ChartProps) {
           <RailCard title="About this index">
             <p className="text-xs leading-relaxed text-muted">
               {id === "bvol"
-                ? "30-day implied volatility for BTC, computed from a strip of OTM Deribit options via the CBOE-style variance integral. Updated every 60 seconds."
-                : "30-day implied volatility for ETH, computed from a strip of OTM Deribit options via the CBOE-style variance integral. Updated every 60 seconds."}
+                ? "30-day implied volatility for BTC, computed per venue from a strip of OTM options on Deribit, OKX, and Bybit, then median-blended across venues via the CBOE-style variance integral. Updated every 60 seconds."
+                : "30-day implied volatility for ETH, computed per venue from a strip of OTM options on Deribit, OKX, and Bybit, then median-blended across venues via the CBOE-style variance integral. Updated every 60 seconds."}
             </p>
           </RailCard>
 
@@ -635,7 +635,7 @@ export function Chart({ id }: ChartProps) {
       </section>
 
       <footer className="mt-6 flex flex-wrap items-center justify-between gap-2 text-[11px] text-soft">
-        <span>data source: deribit options · CBOE-style variance integral</span>
+        <span>data sources: deribit · okx · bybit · median blend · CBOE-style variance integral</span>
         <span>
           {liveTick
             ? `updated ${new Date(liveTick.ts).toLocaleTimeString()}`
