@@ -15,7 +15,8 @@ import { fetchHistory, type HistoryBar, type IndexId } from "@/lib/api";
 import { useIndexTicks } from "@/lib/useIndexTicks";
 import { useTheme } from "@/lib/theme";
 import { DEFAULT_TIMEFRAME, TIMEFRAMES, TIMEFRAME_SPEC, type Timeframe } from "@/lib/timeframes";
-import { ThemeToggle } from "./ThemeToggle";
+import { LivePulse } from "./LivePulse";
+import { ConfidenceRing } from "./ConfidenceRing";
 
 echarts.use([
   CandlestickChart,
@@ -101,35 +102,35 @@ function readChartTheme(theme: "dark" | "light"): ChartPalette {
       down: "#dc2626",
       upGlow: "rgba(22,163,74,0.35)",
       downGlow: "rgba(220,38,38,0.35)",
-      text: "rgba(10,10,12,0.95)",
-      textStrong: "rgba(10,10,12,1)",
-      textMuted: "rgba(10,10,12,0.7)",
-      grid: "rgba(10,10,12,0.06)",
-      gridStrong: "rgba(10,10,12,0.12)",
+      text: "rgba(10,14,26,0.92)",
+      textStrong: "rgba(10,14,26,1)",
+      textMuted: "rgba(10,14,26,0.66)",
+      grid: "rgba(10,14,26,0.05)",
+      gridStrong: "rgba(10,14,26,0.10)",
       tooltipBg: "rgba(255,255,255,0.98)",
-      tooltipBorder: "rgba(10,10,12,0.15)",
-      lineColor: "#6366f1",
-      lineGradTop: "rgba(99,102,241,0.22)",
-      lineGradBot: "rgba(99,102,241,0.0)",
-      ema: "rgba(234,88,12,0.85)",
+      tooltipBorder: "rgba(10,14,26,0.15)",
+      lineColor: "#0891b2",
+      lineGradTop: "rgba(8,145,178,0.18)",
+      lineGradBot: "rgba(8,145,178,0.0)",
+      ema: "rgba(234,88,12,0.78)",
     };
   }
   return {
     up: "#4ade80",
     down: "#f87171",
-    upGlow: "rgba(74,222,128,0.45)",
-    downGlow: "rgba(248,113,113,0.45)",
-    text: "rgba(237,237,237,0.95)",
+    upGlow: "rgba(74,222,128,0.42)",
+    downGlow: "rgba(248,113,113,0.42)",
+    text: "rgba(232,234,237,0.92)",
     textStrong: "rgba(255,255,255,1)",
-    textMuted: "rgba(237,237,237,0.7)",
-    grid: "rgba(255,255,255,0.05)",
-    gridStrong: "rgba(255,255,255,0.12)",
-    tooltipBg: "rgba(15,15,18,0.97)",
-    tooltipBorder: "rgba(255,255,255,0.12)",
-    lineColor: "#a78bfa",
-    lineGradTop: "rgba(167,139,250,0.32)",
-    lineGradBot: "rgba(167,139,250,0.0)",
-    ema: "rgba(251,146,60,0.9)",
+    textMuted: "rgba(232,234,237,0.66)",
+    grid: "rgba(255,255,255,0.045)",
+    gridStrong: "rgba(255,255,255,0.10)",
+    tooltipBg: "rgba(17,22,42,0.97)",
+    tooltipBorder: "rgba(6,182,212,0.18)",
+    lineColor: "#22d3ee",
+    lineGradTop: "rgba(6,182,212,0.26)",
+    lineGradBot: "rgba(6,182,212,0.0)",
+    ema: "rgba(251,146,60,0.85)",
   };
 }
 
@@ -501,7 +502,6 @@ export function Chart({ id }: ChartProps) {
   }, [liveTick]);
 
   const value = liveTick?.value ?? stats?.close;
-  const live = wsState === "open";
 
   const headerDelta = useMemo<{ label: string; tone: "up" | "down" } | null>(() => {
     if (!stats) return null;
@@ -513,45 +513,41 @@ export function Chart({ id }: ChartProps) {
   }, [stats]);
 
   return (
-    <div className="mx-auto w-full max-w-screen-2xl px-4 py-5 sm:px-6 lg:px-10">
-      <section className="flex flex-col gap-2">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2 text-[10px] uppercase tracking-[0.25em] text-soft">
-            <span>VolX</span>
-            <span className="text-soft-2">/</span>
-            <span className="text-muted">{id}</span>
-            <span className="text-soft-2">— {NAME[id]}</span>
-          </div>
-          <ThemeToggle />
+    <div className="mx-auto w-full max-w-screen-2xl px-4 py-8 sm:px-6 lg:px-10">
+      <section className="flex flex-col gap-3">
+        <div className="flex items-center gap-3 text-[10px] font-medium uppercase tracking-[0.22em]">
+          <span className="text-accent">{id}</span>
+          <span className="text-soft-2">/</span>
+          <span className="text-muted">{NAME[id]}</span>
+          <span className="text-soft-2">·</span>
+          <span className="text-soft">30-day implied vol</span>
         </div>
-        <div className="flex flex-wrap items-end justify-between gap-4">
-          <div className="flex items-end gap-4">
-            <span className="text-5xl font-semibold tabular-nums tracking-tight sm:text-6xl">
+        <div className="flex flex-wrap items-end justify-between gap-6">
+          <div className="flex items-end gap-5">
+            <span className="font-mono text-6xl font-semibold tabular-nums leading-none tracking-tight text-foreground sm:text-7xl md:text-8xl">
               {value !== undefined ? value.toFixed(2) : "—"}
             </span>
             {headerDelta && (
-              <span
-                className={
-                  headerDelta.tone === "up"
-                    ? "mb-1 inline-flex rounded-full bg-up-soft px-2.5 py-0.5 text-sm font-medium text-up"
-                    : "mb-1 inline-flex rounded-full bg-down-soft px-2.5 py-0.5 text-sm font-medium text-down"
-                }
-              >
-                {headerDelta.label} {timeframe}
-              </span>
+              <div className="mb-2 flex flex-col gap-1">
+                <span
+                  className={`font-mono text-base font-semibold tabular-nums ${
+                    headerDelta.tone === "up" ? "text-up" : "text-down"
+                  }`}
+                >
+                  {headerDelta.label}
+                </span>
+                <span className="text-[10px] font-medium uppercase tracking-[0.22em] text-soft-2">
+                  {timeframe}
+                </span>
+              </div>
             )}
           </div>
-          <div className="flex items-center gap-3 text-[10px] uppercase tracking-widest text-soft">
-            <span className="inline-flex items-center gap-1.5">
-              <span
-                className={`inline-block h-1.5 w-1.5 rounded-full ${
-                  live ? "bg-up" : "bg-amber-400"
-                }`}
-              />
-              {live ? "live" : wsState}
-            </span>
-            <span className="text-soft-2">•</span>
-            <span>60 s cadence</span>
+          <div className="mb-1 flex items-center gap-4 text-[10px] font-medium uppercase tracking-[0.22em] text-soft">
+            <LivePulse state={wsState} />
+            <span className="text-soft-2">·</span>
+            <span>60s cadence</span>
+            <span className="text-soft-2">·</span>
+            <span>3 venues</span>
           </div>
         </div>
       </section>
@@ -602,28 +598,47 @@ export function Chart({ id }: ChartProps) {
         </div>
 
         <aside className="col-span-12 flex flex-col gap-3 xl:col-span-3">
+          <RailCard title="Live confidence">
+            <div className="flex items-center gap-4">
+              <ConfidenceRing
+                value={
+                  liveTick?.confidence !== undefined
+                    ? liveTick.confidence
+                    : stats?.avgConfidence !== undefined
+                      ? stats.avgConfidence
+                      : null
+                }
+                size={72}
+                thickness={5}
+              />
+              <div className="flex flex-1 flex-col gap-1.5 text-xs">
+                <span className="text-muted">
+                  {confidenceState(
+                    liveTick?.confidence ?? stats?.avgConfidence ?? null,
+                  )}
+                </span>
+                <span className="text-soft-2">venue × freshness × strikes</span>
+              </div>
+            </div>
+          </RailCard>
+
           <RailCard title="About this index">
             <p className="text-xs leading-relaxed text-muted">
               {id === "bvol"
-                ? "30-day implied volatility for BTC, computed per venue from a strip of OTM options on Deribit, OKX, and Bybit, then median-blended across venues via the CBOE-style variance integral. Updated every 60 seconds."
-                : "30-day implied volatility for ETH, computed per venue from a strip of OTM options on Deribit, OKX, and Bybit, then median-blended across venues via the CBOE-style variance integral. Updated every 60 seconds."}
+                ? "30-day implied volatility for BTC, computed per venue from a strip of OTM options on "
+                : "30-day implied volatility for ETH, computed per venue from a strip of OTM options on "}
+              <span className="font-mono text-foreground">deribit</span>,{" "}
+              <span className="font-mono text-foreground">okx</span>, and{" "}
+              <span className="font-mono text-foreground">bybit</span>, then median-blended across
+              venues via the CBOE-style variance integral. Updated every 60 seconds.
             </p>
           </RailCard>
 
           <RailCard title="Live snapshot">
             <Row k="last value" v={value !== undefined ? value.toFixed(2) : "—"} />
-            <Row
-              k="confidence"
-              v={
-                liveTick?.confidence !== undefined
-                  ? liveTick.confidence.toFixed(2)
-                  : stats?.avgConfidence !== undefined
-                    ? stats.avgConfidence.toFixed(2)
-                    : "—"
-              }
-            />
             <Row k="last tick" v={liveTick ? new Date(liveTick.ts).toLocaleTimeString() : "—"} />
             <Row k="cadence" v="60 s" />
+            <Row k="venues" v="3 / 3" />
           </RailCard>
 
           <RailCard title="Window">
@@ -671,7 +686,15 @@ function Row({ k, v, tone }: { k: string; v: string; tone?: "up" | "down" }) {
   return (
     <div className="flex items-baseline justify-between text-xs">
       <span className="text-soft">{k}</span>
-      <span className={`tabular-nums ${valueCls}`}>{v}</span>
+      <span className={`font-mono tabular-nums ${valueCls}`}>{v}</span>
     </div>
   );
+}
+
+function confidenceState(v: number | null): string {
+  if (v === null) return "awaiting first tick";
+  if (v >= 0.85) return "healthy — full venue coverage, fresh quotes";
+  if (v >= 0.5) return "operational — minor degradation in one factor";
+  if (v >= 0.25) return "degraded — venue dropped or quotes stale";
+  return "stale — multiple factors below threshold";
 }

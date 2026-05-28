@@ -1,5 +1,7 @@
 import { notFound } from "next/navigation";
 import { Chart } from "@/components/Chart";
+import { Footer } from "@/components/Footer";
+import { Header } from "@/components/Header";
 import type { IndexId } from "@/lib/api";
 
 type Params = Promise<{ index: string }>;
@@ -12,8 +14,12 @@ export default async function ChartPage({ params }: { params: Params }) {
     notFound();
   }
   return (
-    <main className="min-h-screen">
-      <Chart id={index as IndexId} />
+    <main className="flex min-h-screen flex-col">
+      <Header />
+      <div className="flex-1">
+        <Chart id={index as IndexId} />
+      </div>
+      <Footer />
     </main>
   );
 }
