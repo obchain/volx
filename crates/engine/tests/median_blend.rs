@@ -22,6 +22,7 @@ use volx_shared_types::ids::{IndexId, Venue};
 use volx_shared_types::units::Years;
 
 use volx_engine::chain::{AssetChains, MultiVenueChains, VenueChains};
+use volx_engine::outlier::OutlierTracker;
 use volx_engine::strip::{ChainLeg, ExpiryChain};
 use volx_engine::{SnapshotError, bs};
 
@@ -92,7 +93,9 @@ fn single_venue_publishes_passthrough() {
     // the blended publish must equal the single venue's BVOL —
     // identical to the pre-#61 single-venue behaviour.
     let chains = multi_venue(&[(Venue::Deribit, 0.5)]);
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+            .unwrap();
     assert_eq!(res.per_venue.len(), 1);
     assert_eq!(res.per_venue[0].venue, Venue::Deribit);
     // Blend == per-venue value (exactly — single-element median is
@@ -115,7 +118,9 @@ fn three_venues_blend_to_median() {
         (Venue::Deribit, 0.5),
         (Venue::Okx, 0.6),
     ]);
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+            .unwrap();
     assert_eq!(res.per_venue.len(), 3);
     // Iteration order is alpha on Venue.label(): bybit < deribit < okx.
     assert_eq!(res.per_venue[0].venue, Venue::Bybit);
@@ -142,7 +147,9 @@ fn three_venues_one_outlier_median_ignores_it() {
         (Venue::Deribit, 0.5),
         (Venue::Okx, 5.0),
     ]);
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+            .unwrap();
     assert_eq!(res.per_venue.len(), 3);
     // The Okx per-venue value is the outlier; the median must be
     // one of the two non-Okx values.
@@ -170,7 +177,9 @@ fn two_venues_blend_is_mean_of_pair() {
     // the per-venue arithmetic mean. This is the documented even-
     // count behaviour — outlier protection requires three venues.
     let chains = multi_venue(&[(Venue::Deribit, 0.4), (Venue::Okx, 0.6)]);
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+            .unwrap();
     assert_eq!(res.per_venue.len(), 2);
     let expected = f64::midpoint(res.per_venue[0].value, res.per_venue[1].value);
     assert!(
@@ -203,7 +212,7 @@ fn no_venues_live_rejects_with_dedicated_error() {
         );
         chains.insert(venue, per_venue);
     }
-    match volx_engine::run_snapshot(&chains, IndexId::Bvol, now, 3) {
+    match volx_engine::run_snapshot(&chains, IndexId::Bvol, now, 3, &mut OutlierTracker::new()) {
         Err(SnapshotError::NoVenuesLive {
             asset: Asset::Btc,
             per_venue_errors,
@@ -228,7 +237,7 @@ fn missing_asset_distinguished_from_no_venues_live() {
     // pipeline failed" (NoVenuesLive). The two error labels back
     // separate dashboards.
     let chains: MultiVenueChains = HashMap::new();
-    match volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3) {
+    match volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new()) {
         Err(SnapshotError::MissingAsset(Asset::Btc)) => {}
         other => panic!("expected MissingAsset(Btc), got {other:?}"),
     }
@@ -253,7 +262,9 @@ fn partial_venue_failure_still_publishes_with_survivors() {
     );
     chains.insert(Venue::Bybit, bybit_chains);
 
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+            .unwrap();
     assert_eq!(res.per_venue.len(), 2);
     assert_eq!(res.per_venue_errors.len(), 1);
     assert_eq!(res.per_venue_errors[0].0, Venue::Bybit);
@@ -278,8 +289,10 @@ fn strip_hash_changes_when_venue_set_changes() {
         (Venue::Deribit, 0.5),
         (Venue::Okx, 0.5),
     ]);
-    let a = volx_engine::run_snapshot(&two, IndexId::Bvol, now(), 3).unwrap();
-    let b = volx_engine::run_snapshot(&three, IndexId::Bvol, now(), 3).unwrap();
+    let a = volx_engine::run_snapshot(&two, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+        .unwrap();
+    let b = volx_engine::run_snapshot(&three, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+        .unwrap();
     assert_ne!(a.value.strip_hash, b.value.strip_hash);
 }
 
@@ -293,7 +306,9 @@ fn primary_strips_is_alpha_first_venue() {
         (Venue::Deribit, 0.5),
         (Venue::Okx, 0.5),
     ]);
-    let res = volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3).unwrap();
+    let res =
+        volx_engine::run_snapshot(&chains, IndexId::Bvol, now(), 3, &mut OutlierTracker::new())
+            .unwrap();
     assert_eq!(res.per_venue[0].venue, Venue::Bybit);
     let (near, _next) = res.primary_strips().unwrap();
     // Strip itself is the Bybit venue's near-expiry strip — same
