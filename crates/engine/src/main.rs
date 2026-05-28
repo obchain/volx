@@ -44,6 +44,13 @@ use volx_engine::{chain, sinks::IndexSinks, snapshot};
 /// Recompute cadence per `METHODOLOGY.md` §5.
 const TICK_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Steady-state venue count for the confidence score's `venue_term`.
+/// Overridden by `ENGINE_VENUES_EXPECTED` so an operator can dial it
+/// down during the period when only a subset of connectors has
+/// shipped — otherwise confidence prematurely caps at `live / 3`
+/// before all three ingest crates are deployed.
+const DEFAULT_VENUES_EXPECTED: usize = 3;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -58,11 +65,13 @@ async fn main() -> Result<()> {
         std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
     let clickhouse_db = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "volx".into());
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let venues_expected = parse_venues_expected_env();
 
     info!(
         version = volx_shared_types::METHODOLOGY_VERSION,
         clickhouse = %clickhouse_url,
         redis = %redis_url,
+        venues_expected,
         "volx-engine starting"
     );
 
@@ -94,14 +103,54 @@ async fn main() -> Result<()> {
             }
             _ = ticker.tick() => {
                 let now = OffsetDateTime::now_utc();
-                run_tick(&reader, &mut sinks, now).await;
+                run_tick(&reader, &mut sinks, now, venues_expected).await;
             }
         }
     }
 }
 
+/// Resolve `ENGINE_VENUES_EXPECTED` with loud failure modes:
+///
+/// - Unset → silent default (3).
+/// - Parse failure → `warn!` and fall back to default, so an
+///   operator chasing an unexpected confidence value has a log line
+///   instead of silence.
+/// - `0` → accepted but `warn!`-ed, because it disables the
+///   `venue_term` of the confidence score entirely (see
+///   `confidence::score` docs).
+fn parse_venues_expected_env() -> usize {
+    let Some(raw) = std::env::var("ENGINE_VENUES_EXPECTED").ok() else {
+        return DEFAULT_VENUES_EXPECTED;
+    };
+    match raw.parse::<usize>() {
+        Ok(0) => {
+            warn!(
+                "ENGINE_VENUES_EXPECTED=0; venue_term will always be 1.0 — \
+                 this disables the venue-coverage signal and is almost \
+                 certainly a misconfiguration"
+            );
+            0
+        }
+        Ok(n) => n,
+        Err(e) => {
+            warn!(
+                raw = %raw,
+                error = %e,
+                default = DEFAULT_VENUES_EXPECTED,
+                "ENGINE_VENUES_EXPECTED is not a valid usize; using default"
+            );
+            DEFAULT_VENUES_EXPECTED
+        }
+    }
+}
+
 /// Pull chains, run every index, publish or count-the-rejection.
-async fn run_tick(reader: &ChClient, sinks: &mut IndexSinks, now: OffsetDateTime) {
+async fn run_tick(
+    reader: &ChClient,
+    sinks: &mut IndexSinks,
+    now: OffsetDateTime,
+    venues_expected: usize,
+) {
     let chains = match chain::fetch_chains(reader, now).await {
         Ok(c) => c,
         Err(e) => {
@@ -114,7 +163,7 @@ async fn run_tick(reader: &ChClient, sinks: &mut IndexSinks, now: OffsetDateTime
 
     for index in [IndexId::Bvol, IndexId::Evol] {
         let ticker = index.ticker();
-        match snapshot::run_snapshot(&chains, index, now) {
+        match snapshot::run_snapshot(&chains, index, now, venues_expected) {
             Ok(res) => {
                 // Per-venue rejection counter is observability for the
                 // partial-survivor case — the blended publish below

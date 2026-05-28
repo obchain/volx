@@ -99,6 +99,52 @@ pub fn build_strip(chain: &ExpiryChain) -> Result<Strip, BuildError> {
     build_strip_with_rate(chain, 0.0)
 }
 
+/// Build a [`Strip`] **and** report the count of listed strikes that
+/// carried a usable IV after filtering — the input to the confidence
+/// score's `strike_term` (issue #62, `confidence::ConfidenceInputs::strip_strikes`).
+///
+/// The count is the number of distinct listed strikes whose
+/// `pick_iv(...)` returned `Some(finite)` and whose `(K / F).ln()`
+/// was finite — i.e. the same `xs.len()` the §4.3 spline was fitted
+/// on. This is the methodology-relevant count; the dense 801-point
+/// grid downstream is always full by construction and is not a
+/// quality signal.
+///
+/// Returned `Ok((strip, listed_count))` mirrors the [`build_strip`]
+/// success path one-for-one — both call sites share the same
+/// builder via [`build_strip_with_rate`].
+///
+/// # Errors
+///
+/// Same set as [`build_strip_with_rate`].
+pub fn build_strip_with_count(chain: &ExpiryChain) -> Result<(Strip, usize), BuildError> {
+    let strip = build_strip_with_rate(chain, 0.0)?;
+    let count = count_listed_iv(chain, strip.forward);
+    Ok((strip, count))
+}
+
+/// Count of listed strikes whose `pick_iv` would have contributed to
+/// the spline fit. Mirrors the filter in [`build_strip_with_rate`]
+/// (the `for leg in &legs { let Some(iv) = pick_iv(leg) else …; … }`
+/// loop) **byte-for-byte** — if a filter rule changes in the
+/// builder, change it here too or the confidence score will drift
+/// from the count the spline actually consumed.
+fn count_listed_iv(chain: &ExpiryChain, forward: f64) -> usize {
+    let mut n = 0;
+    for leg in &chain.legs {
+        let Some(iv) = pick_iv(leg) else { continue };
+        if !leg.strike.is_finite() || leg.strike <= 0.0 {
+            continue;
+        }
+        let x = (leg.strike / forward).ln();
+        if !x.is_finite() || !iv.is_finite() {
+            continue;
+        }
+        n += 1;
+    }
+    n
+}
+
 /// Variant that takes an explicit `r` — only useful for tests and for
 /// the future-version §4.4 bump to a USDC/USDT lending rate.
 ///

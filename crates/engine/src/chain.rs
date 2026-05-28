@@ -56,6 +56,11 @@ struct ChainRow {
     mid: Option<f64>,
     iv: Option<f64>,
     underlying: f64,
+    /// Newest `ts` in this `(venue, asset, expiry, strike, kind)`
+    /// group — feeds the per-venue freshness signal that backs
+    /// `confidence::ConfidenceInputs::max_quote_age` (issue #62).
+    #[serde(with = "clickhouse::serde::time::datetime64::millis")]
+    latest_ts: OffsetDateTime,
 }
 
 /// Why a chain build can fail.
@@ -70,6 +75,30 @@ pub enum ChainError {
 /// keys on `Asset` and the inner map on `OffsetDateTime`.
 pub type AssetChains = HashMap<Asset, HashMap<OffsetDateTime, ExpiryChain>>;
 
+/// One venue's chain data plus the per-venue freshness signal.
+/// `latest_ts` is the newest `options_ticks.ts` observed across every
+/// `(asset, expiry, strike, kind)` row this venue contributed — used
+/// by `confidence::score` to demote venues whose feed has gone quiet
+/// (issue #62, `confidence::ConfidenceInputs::max_quote_age`).
+#[derive(Debug, Clone)]
+pub struct VenueChains {
+    pub assets: AssetChains,
+    pub latest_ts: OffsetDateTime,
+}
+
+impl Default for VenueChains {
+    /// Empty assets + `latest_ts = UNIX_EPOCH`. The epoch sentinel is
+    /// the same one `assemble_chains` starts with before folding
+    /// rows in; production paths overwrite it on the first row.
+    /// Test helpers that build chains manually can set it directly.
+    fn default() -> Self {
+        Self {
+            assets: AssetChains::default(),
+            latest_ts: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+}
+
 /// Per-venue, per-asset chains. Outer key is the venue the rows came
 /// from; the inner [`AssetChains`] follows the §4.1 per-venue picker
 /// (issue #61). One venue's chains never share a strip with another's
@@ -77,7 +106,7 @@ pub type AssetChains = HashMap<Asset, HashMap<OffsetDateTime, ExpiryChain>>;
 /// mix legs whose bid/ask come from different order books and the
 /// strip builder's §4.2 forward picker would get a chain whose call
 /// and put legs disagree on the underlying.
-pub type MultiVenueChains = HashMap<Venue, AssetChains>;
+pub type MultiVenueChains = HashMap<Venue, VenueChains>;
 
 /// Pull the latest tick per `(asset, expiry, strike, kind)` from
 /// `ClickHouse` and assemble per-expiry chains.
@@ -131,7 +160,8 @@ pub async fn fetch_chains(
             argMax(ask, ts)        AS ask,
             argMax(mid, ts)        AS mid,
             argMax(iv,  ts)        AS iv,
-            argMax(underlying, ts) AS underlying
+            argMax(underlying, ts) AS underlying,
+            max(ts)                AS latest_ts
         FROM volx.options_ticks
         WHERE ts >= fromUnixTimestamp64Milli(?)
         GROUP BY venue, asset, expiry, strike, kind
@@ -176,8 +206,18 @@ fn assemble_chains(rows: Vec<ChainRow>, now: OffsetDateTime) -> MultiVenueChains
             continue;
         }
 
-        let per_venue = out.entry(venue).or_default();
-        let per_asset = per_venue.entry(asset).or_default();
+        // Per-venue freshness: max across every contributing row.
+        // Initial sentinel is `OffsetDateTime::UNIX_EPOCH` so the
+        // first row's `latest_ts` always wins. Confidence pulls
+        // `now - latest_ts` to compute the per-venue quote age.
+        let per_venue = out.entry(venue).or_insert_with(|| VenueChains {
+            assets: HashMap::new(),
+            latest_ts: OffsetDateTime::UNIX_EPOCH,
+        });
+        if row.latest_ts > per_venue.latest_ts {
+            per_venue.latest_ts = row.latest_ts;
+        }
+        let per_asset = per_venue.assets.entry(asset).or_default();
         let chain = per_asset.entry(row.expiry).or_insert_with(|| ExpiryChain {
             time_to_expiry: year_fraction(now, row.expiry),
             legs: Vec::new(),
@@ -324,6 +364,12 @@ mod tests {
             mid,
             iv,
             underlying: 100_000.0,
+            // Most tests don't care about freshness — peg latest_ts
+            // to `now` (datetime!(2026-05-25 …)) so the per-venue
+            // `latest_ts` lands at a deterministic value the tests
+            // can ignore. Freshness-specific tests build their own
+            // rows.
+            latest_ts: time::macros::datetime!(2026-05-25 00:00:00 UTC),
         }
     }
 
@@ -358,7 +404,7 @@ mod tests {
             row("deribit", "doge", exp, 100.0, "call", Some(1.0), Some(0.5)),
         ];
         let out = assemble_chains(rows, now);
-        let by_asset = &out[&Venue::Deribit];
+        let by_asset = &out[&Venue::Deribit].assets;
         assert!(by_asset.contains_key(&Asset::Btc));
         assert_eq!(by_asset.len(), 1);
     }
@@ -380,7 +426,7 @@ mod tests {
             ),
         ];
         let out = assemble_chains(rows, now);
-        let chain = &out[&Venue::Deribit][&Asset::Btc][&exp];
+        let chain = &out[&Venue::Deribit].assets[&Asset::Btc][&exp];
         assert_eq!(chain.legs.len(), 1);
         assert!(chain.legs[0].call_mid_usd.is_some());
         assert!(chain.legs[0].put_mid_usd.is_none());
@@ -414,7 +460,7 @@ mod tests {
             row("deribit", "btc", exp, 100.0, "call", Some(1.0), Some(0.5)),
         ];
         let out = assemble_chains(rows, now);
-        let chain = &out[&Venue::Deribit][&Asset::Btc][&exp];
+        let chain = &out[&Venue::Deribit].assets[&Asset::Btc][&exp];
         assert_eq!(chain.legs.len(), 1, "only the K=100 row should survive");
         assert_eq!(chain.legs[0].strike, 100.0);
     }
@@ -428,7 +474,7 @@ mod tests {
             row("deribit", "btc", exp, 100.0, "put", Some(4.0), Some(0.55)),
         ];
         let out = assemble_chains(rows, now);
-        let chain = &out[&Venue::Deribit][&Asset::Btc][&exp];
+        let chain = &out[&Venue::Deribit].assets[&Asset::Btc][&exp];
         assert_eq!(chain.legs.len(), 1);
         assert_eq!(chain.legs[0].strike, 100.0);
         assert_eq!(chain.legs[0].call_mid_usd, Some(5.0));
@@ -454,7 +500,7 @@ mod tests {
             row("deribit", "eth", exp, 3_000.0, "call", Some(2.0), Some(0.6)),
         ];
         let out = assemble_chains(rows, now);
-        let by_asset = &out[&Venue::Deribit];
+        let by_asset = &out[&Venue::Deribit].assets;
         assert_eq!(by_asset.len(), 2);
         assert_eq!(by_asset[&Asset::Btc][&exp].legs[0].strike, 100_000.0);
         assert_eq!(by_asset[&Asset::Eth][&exp].legs[0].strike, 3_000.0);
@@ -491,15 +537,15 @@ mod tests {
         let out = assemble_chains(rows, now);
         assert_eq!(out.len(), 3);
         assert_eq!(
-            out[&Venue::Deribit][&Asset::Btc][&exp].legs[0].call_mid_usd,
+            out[&Venue::Deribit].assets[&Asset::Btc][&exp].legs[0].call_mid_usd,
             Some(5.0)
         );
         assert_eq!(
-            out[&Venue::Okx][&Asset::Btc][&exp].legs[0].call_mid_usd,
+            out[&Venue::Okx].assets[&Asset::Btc][&exp].legs[0].call_mid_usd,
             Some(5.1)
         );
         assert_eq!(
-            out[&Venue::Bybit][&Asset::Btc][&exp].legs[0].call_mid_usd,
+            out[&Venue::Bybit].assets[&Asset::Btc][&exp].legs[0].call_mid_usd,
             Some(4.9)
         );
     }
@@ -514,7 +560,7 @@ mod tests {
             row("deribit", "btc", far, 100.0, "call", Some(2.0), Some(0.55)),
         ];
         let out = assemble_chains(rows, now);
-        let by_expiry = &out[&Venue::Deribit][&Asset::Btc];
+        let by_expiry = &out[&Venue::Deribit].assets[&Asset::Btc];
         assert_eq!(by_expiry.len(), 2);
         assert!((by_expiry[&near].time_to_expiry.0 - 7.0 / 365.0).abs() < 1e-12);
         assert!((by_expiry[&far].time_to_expiry.0 - 40.0 / 365.0).abs() < 1e-12);
@@ -537,7 +583,7 @@ mod tests {
             row("deribit", "btc", exp, 100.0, "put", Some(2.0), Some(0.5)),
         ];
         let out = assemble_chains(rows, now);
-        let leg = &out[&Venue::Deribit][&Asset::Btc][&exp].legs[0];
+        let leg = &out[&Venue::Deribit].assets[&Asset::Btc][&exp].legs[0];
         assert_eq!(leg.call_mid_usd, None, "NaN mid filtered to None");
         assert_eq!(leg.call_iv, None, "Inf iv filtered to None");
         assert_eq!(leg.put_mid_usd, Some(2.0));
@@ -558,7 +604,9 @@ mod tests {
             Some(0.5),
         )];
         let out = assemble_chains(rows, now);
-        let tt = out[&Venue::Deribit][&Asset::Btc][&exp].time_to_expiry.0;
+        let tt = out[&Venue::Deribit].assets[&Asset::Btc][&exp]
+            .time_to_expiry
+            .0;
         assert!((tt - 30.0 / 365.0).abs() < 1e-12);
     }
 
