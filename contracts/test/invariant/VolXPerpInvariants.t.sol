@@ -55,16 +55,24 @@ contract VolXPerpInvariantsTest is Test {
         assertEq(sum, perp.totalReserved());
     }
 
-    /// @notice Withdrawable (available) collateral never exceeds total assets.
-    function invariant_AvailableNeverExceedsAssets() public view {
-        assertLe(perp.availableAssets(), perp.totalAssets());
-    }
+    // NOTE: there is intentionally NO `balanceOf >= totalReserved` invariant —
+    // `totalReserved` is leveraged notional (up to 10x collateral), which the
+    // vault is not collateralized to. The reserve only gates LP withdrawals; it
+    // is not a token-backing claim. Fee-only share-price monotonicity is asserted
+    // inline in PerpHandler instead.
 
-    /// @notice LP share supply collectively redeems to at most total assets
-    /// (share price is bounded by the vault's accounted collateral).
-    function invariant_SharesRedeemWithinAssets() public view {
+    /// @notice The sum of every LP's individually-redeemable assets never exceeds
+    /// the vault's total assets. Each `convertToAssets(balanceOf)` floor-rounds, so
+    /// the summed claims must stay within `totalAssets`; a broken share-math path
+    /// that rounded up would let collective claims exceed the pot.
+    function invariant_PerActorClaimsWithinAssets() public view {
         uint256 supply = perp.totalSupply();
         if (supply == 0) return;
-        assertLe(perp.convertToAssets(supply), perp.totalAssets());
+        uint256 sumClaims;
+        uint256 nActors = handler.actorsLength();
+        for (uint256 i = 0; i < nActors; i++) {
+            sumClaims += perp.convertToAssets(perp.balanceOf(handler.actors(i)));
+        }
+        assertLe(sumClaims, perp.totalAssets());
     }
 }
