@@ -15,6 +15,11 @@ optimizer_runs = 200
 deny = "warnings"
 # Remappings live in remappings.txt (single source of truth).
 
+[lint]
+# Purely stylistic; conflicts with the deliberate ERC4626-style lowercase
+# `asset` immutable accessor on the vault. All safety lints stay on.
+exclude_lints = ["screaming-snake-case-immutable"]
+
 [fmt]
 line_length = 100
 tab_width = 4
