@@ -20,6 +20,14 @@ deny = "warnings"
 # `asset` immutable accessor on the vault. All safety lints stay on.
 exclude_lints = ["screaming-snake-case-immutable"]
 
+[fuzz]
+runs = 256
+
+[invariant]
+runs = 64
+depth = 32
+fail_on_revert = false   # handler wraps actions in try/catch; explore valid states
+
 [fmt]
 line_length = 100
 tab_width = 4
