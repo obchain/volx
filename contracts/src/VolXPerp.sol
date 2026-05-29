@@ -116,6 +116,9 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
         if (bal < shares) revert InsufficientShares(bal, shares);
 
         assets = convertToAssets(shares);
+        // Dust guard: never burn shares for zero payout (floor rounding, or an
+        // insolvent vault with _totalAssets==0, can make this 0).
+        if (assets == 0) revert ZeroAssets();
         uint256 available = availableAssets();
         if (assets > available) revert WithdrawExceedsAvailable(assets, available);
 
@@ -128,15 +131,27 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
     }
 
     // --- internal accounting hooks (consumed by #89/#90) --------------------
+    //
+    // INVARIANT for inheriting contracts: `_totalAssets` must stay <=
+    // `asset.balanceOf(this)` (donations make the real balance larger, which is
+    // benign). To preserve it:
+    //   - credit path:  complete `safeTransferFrom(payer, vault, amount)` BEFORE
+    //     calling `_increaseTotalAssets(amount)`.
+    //   - payout path:  call `_decreaseTotalAssets(amount)` BEFORE
+    //     `safeTransfer(recipient, amount)` (effects-before-interaction, exactly
+    //     as `withdraw` does).
+    // Reversing either order risks an irrecoverable accounting/balance desync.
 
-    /// @dev Credit the vault (trader loss or fee). Token must already be held
-    /// or transferred in by the caller path; this only moves the accounting.
+    /// @dev Credit the vault (trader loss or fee). The corresponding tokens must
+    /// already have been transferred in by the caller path; this only moves the
+    /// accounting. See the INVARIANT note above.
     function _increaseTotalAssets(uint256 amount) internal {
         _totalAssets += amount;
     }
 
-    /// @dev Debit the vault (trader win paid out). Reverts on underflow via
-    /// checked arithmetic if a position tries to pay more than the vault holds.
+    /// @dev Debit the vault (trader win to be paid out). Call this BEFORE the
+    /// token `safeTransfer`. Reverts on underflow via checked arithmetic if a
+    /// position tries to pay more than the vault holds. See the INVARIANT note.
     function _decreaseTotalAssets(uint256 amount) internal {
         _totalAssets -= amount;
     }
