@@ -7,10 +7,12 @@ on:
     branches: [main]
     paths:
       - "contracts/**"
+      - ".gitmodules"
       - ".github/workflows/contracts.yml"
   pull_request:
     paths:
       - "contracts/**"
+      - ".gitmodules"
       - ".github/workflows/contracts.yml"
 
 concurrency:
@@ -36,7 +38,7 @@ jobs:
       - name: install foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: "v1.5.1"   # matches local toolchain; avoids drift from floating stable
 
       - run: forge fmt --check
       - run: forge build

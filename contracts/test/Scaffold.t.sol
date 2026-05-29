@@ -12,12 +12,10 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
 /// real suites once those arrive.
 contract ScaffoldTest is Test {
     function test_RemappingsResolve() public pure {
-        // Referencing each interface/type forces the import to compile.
-        // type(...).interfaceId is a cheap, side-effect-free touch.
-        bytes4 erc20Id = type(IERC20).interfaceId;
-        bytes4 ownableId = type(Ownable).interfaceId;
-        assertTrue(erc20Id != bytes4(0), "IERC20 resolved");
-        assertTrue(ownableId != bytes4(0) || ownableId == bytes4(0), "Ownable resolved");
+        // Referencing each type's interfaceId forces the import to compile and
+        // yields a non-zero selector XOR — a falsifiable proof of resolution.
+        assertTrue(type(IERC20).interfaceId != bytes4(0), "IERC20 resolved");
+        assertTrue(type(Ownable).interfaceId != bytes4(0), "Ownable resolved");
     }
 
     function test_ReentrancyGuardImported() public pure {
