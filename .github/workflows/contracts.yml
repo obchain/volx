@@ -1,0 +1,43 @@
+name: contracts-ci
+
+# Foundry gate for the M4 on-chain layer. Only runs when Solidity / contract
+# tooling changes — keeps the Rust/Go/frontend CI matrix untouched.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "contracts/**"
+      - ".github/workflows/contracts.yml"
+  pull_request:
+    paths:
+      - "contracts/**"
+      - ".github/workflows/contracts.yml"
+
+concurrency:
+  group: contracts-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: contracts (fmt + build + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # forge-std + openzeppelin-contracts
+
+      - name: install foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - run: forge fmt --check
+      - run: forge build
+      - run: forge test -vvv
