@@ -1,0 +1,13 @@
+# Foundry build + cache artifacts
+out/
+cache/
+
+# Deploy broadcast logs (per-chain run records; regenerated on deploy)
+broadcast/
+
+# Coverage / gas snapshots are opt-in per run
+lcov.info
+*.lcov
+
+# Env / secrets — testnet keys live in repo-root .secrets/ (gitignored there too)
+.env

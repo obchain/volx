@@ -1,0 +1,26 @@
+# VolX on-chain layer (M4). Greenfield Foundry project; contracts land in
+# follow-up issues (#86 MockUSDC, #87 Oracle, #88-#90 Perp). Demo/testnet
+# scope only — Ethereum Sepolia (11155111), not audited, not mainnet.
+[profile.default]
+src = "src"
+out = "out"
+test = "test"
+script = "script"
+libs = ["lib"]
+solc = "0.8.28"
+evm_version = "cancun"        # Sepolia supports cancun
+optimizer = true
+optimizer_runs = 200
+# Treat warnings as errors so dead code / shadowing can't accrue.
+deny = "warnings"
+# Remappings live in remappings.txt (single source of truth).
+
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = true
+int_types = "long"
+quote_style = "double"
+number_underscore = "thousands"
+
+# See https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
