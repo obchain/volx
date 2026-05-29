@@ -11,14 +11,15 @@ import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import { VolXOracle } from "./VolXOracle.sol";
 
-/// @title VolXPerp (LP vault portion)
-/// @notice gTrade-style shared collateral vault: a single pot of LP-supplied
-/// collateral (MockUSDC) is the counterparty to every trade. LPs deposit and
+/// @title VolXPerp
+/// @notice gTrade-style synthetic volatility perp. A single pot of LP-supplied
+/// collateral (MockUSDC) is the counterparty to every trade: LPs deposit and
 /// receive `vxLP` shares; the vault's value grows by trader losses + fees and
-/// shrinks by trader wins. This contract implements the vault accounting only —
-/// position open/close, PnL, liquidation and fees land in #89/#90 and feed the
-/// vault through the internal hooks {_increaseTotalAssets} / {_decreaseTotalAssets}.
-/// Testnet demo only (Sepolia), not audited.
+/// shrinks by trader wins. Traders open leveraged long/short bets on the BVOL/
+/// EVOL indices priced by {VolXOracle}, settling PnL against the vault on close
+/// or liquidation. Loss is capped at collateral and a winning long's gain is
+/// capped at notional, so the vault stays solvent against its reserve.
+/// Testnet demo only (Sepolia), not audited. No funding rate in v1.
 /// @dev ERC4626-style share math, but `totalAssets` is tracked in an internal
 /// accounting variable (not `token.balanceOf(this)`) so that direct token
 /// donations cannot inflate the share price (classic ERC4626 donation attack),
@@ -51,8 +52,23 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
     /// @notice Close fee in basis points (0.1%).
     uint256 public constant CLOSE_FEE_BPS = 10;
 
+    /// @notice Liquidation trigger: a position is liquidatable once its
+    /// unrealized loss reaches this fraction of collateral (80%).
+    uint256 public constant LIQ_THRESHOLD_BPS = 8000;
+
+    /// @notice Liquidator reward, as a fraction of collateral (1%), paid from
+    /// the liquidated position's remaining equity.
+    uint256 public constant LIQ_REWARD_BPS = 100;
+
     /// @notice Basis-point denominator.
     uint256 public constant BPS = 10_000;
+
+    /// @notice Categorises a {FeeCollected} event.
+    enum FeeKind {
+        Open,
+        Close,
+        LiquidationReward
+    }
 
     /// @notice An open leveraged bet against the vault.
     /// @param trader position owner
@@ -93,6 +109,7 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
     error CollateralBelowOpenFee(uint256 collateral, uint256 openFee);
     error PositionNotFound(uint256 id);
     error NotPositionOwner(address caller, address owner);
+    error NotLiquidatable(uint256 id, uint256 loss, uint256 threshold);
 
     event Deposit(address indexed caller, uint256 assets, uint256 shares);
     event Withdraw(address indexed caller, uint256 assets, uint256 shares);
@@ -115,6 +132,15 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
         uint256 payout,
         uint256 closeFee
     );
+    event PositionLiquidated(
+        uint256 indexed id,
+        address indexed trader,
+        address indexed liquidator,
+        uint256 markPrice,
+        uint256 reward,
+        uint256 vaultGain
+    );
+    event FeeCollected(uint256 indexed id, FeeKind kind, uint256 amount);
 
     /// @param asset_ collateral token (must expose `decimals()`)
     /// @param oracle_ price source
@@ -279,6 +305,7 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
         emit PositionOpened(
             id, msg.sender, index, isLong, working, leverage, entryPrice, notional, openFee
         );
+        emit FeeCollected(id, FeeKind.Open, openFee);
     }
 
     /// @notice Close your position, settling PnL against the vault. Loss is
@@ -314,6 +341,54 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
 
         if (payout > 0) asset.safeTransfer(p.trader, payout);
         emit PositionClosed(id, p.trader, markPrice, pnl, payout, closeFee);
+        emit FeeCollected(id, FeeKind.Close, closeFee);
+    }
+
+    /// @notice True if `id` is open and its unrealized loss has reached
+    /// {LIQ_THRESHOLD_BPS} of collateral. Uses the raw (unchecked) oracle price
+    /// so keepers/UIs can poll without reverting on a momentarily stale feed;
+    /// {liquidate} itself re-reads with the staleness guard.
+    function isLiquidatable(uint256 id) public view returns (bool) {
+        Position memory p = positions[id];
+        if (p.trader == address(0)) return false;
+        (uint64 mark,,) = oracle.getPrice(p.index);
+        int256 pnl = _pnl(p, uint256(mark), p.collateral * p.leverage);
+        if (pnl >= 0) return false;
+        uint256 loss = (-pnl).toUint256();
+        return loss >= Math.mulDiv(p.collateral, LIQ_THRESHOLD_BPS, BPS);
+    }
+
+    /// @notice Force-close an underwater position (anyone may call). The caller
+    /// earns a liquidation reward from the position's remaining equity; the rest
+    /// of the collateral goes to the vault. The liquidated trader receives nothing.
+    /// @param id position id
+    function liquidate(uint256 id) external nonReentrant {
+        Position memory p = positions[id];
+        if (p.trader == address(0)) revert PositionNotFound(id);
+
+        (uint64 mark,,) = oracle.getPriceChecked(p.index);
+        uint256 markPrice = uint256(mark);
+        uint256 notional = p.collateral * p.leverage;
+        int256 pnl = _pnl(p, markPrice, notional);
+
+        uint256 loss = pnl < 0 ? (-pnl).toUint256() : 0;
+        uint256 threshold = Math.mulDiv(p.collateral, LIQ_THRESHOLD_BPS, BPS);
+        if (loss < threshold) revert NotLiquidatable(id, loss, threshold);
+
+        // Remaining equity (collateral net of loss); reward carved from it, the
+        // rest forfeited to the vault as the liquidation penalty.
+        int256 raw = p.collateral.toInt256() + pnl;
+        uint256 equity = raw > 0 ? raw.toUint256() : 0;
+        uint256 reward = Math.min(Math.mulDiv(p.collateral, LIQ_REWARD_BPS, BPS), equity);
+        uint256 vaultGain = p.collateral - reward;
+
+        _increaseTotalAssets(vaultGain);
+        totalReserved -= notional;
+        delete positions[id];
+
+        if (reward > 0) asset.safeTransfer(msg.sender, reward);
+        emit PositionLiquidated(id, p.trader, msg.sender, markPrice, reward, vaultGain);
+        emit FeeCollected(id, FeeKind.LiquidationReward, reward);
     }
 
     /// @notice Live PnL + equity for a position, at the current (raw) oracle
