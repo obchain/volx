@@ -142,11 +142,12 @@ contract VolXPerpLiquidationTest is Test {
         _setBvol(552e7); // -8%, would be liquidatable when fresh
 
         uint256 maxStale = oracle.MAX_STALENESS();
+        (, uint64 updatedAt,) = oracle.getPrice(VolXOracle.Index.BVOL); // captured, not literal
         vm.warp(block.timestamp + maxStale + 1);
         bytes memory err = abi.encodeWithSelector(
             VolXOracle.StalePrice.selector,
             VolXOracle.Index.BVOL,
-            uint64(1_700_000_000), // price was last set at setUp's warp time
+            updatedAt,
             block.timestamp,
             maxStale
         );
@@ -154,6 +155,24 @@ contract VolXPerpLiquidationTest is Test {
         vm.prank(liquidator);
         vm.expectRevert(err);
         perp.liquidate(id);
+    }
+
+    function test_ShortLiquidatedWhenIndexRises() public {
+        // Short 10x: collateral 1000 -> working 990, notional 9900.
+        vm.prank(alice);
+        uint256 id = perp.openPosition(VolXOracle.Index.BVOL, false, 1000 * ONE, 10);
+        uint256 taAfterOpen = perp.totalAssets();
+
+        _setBvol(648e7); // +8% -> short loses 792 == threshold
+
+        assertTrue(perp.isLiquidatable(id));
+        uint256 expectedReward = 99 * ONE / 10; // 9.9
+        vm.prank(liquidator);
+        perp.liquidate(id);
+
+        assertEq(usdc.balanceOf(liquidator), expectedReward);
+        assertEq(perp.totalAssets() - taAfterOpen, (990 * ONE) - expectedReward);
+        assertEq(perp.totalReserved(), 0);
     }
 
     function test_LiquidateNonexistentReverts() public {

@@ -63,11 +63,12 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
     /// @notice Basis-point denominator.
     uint256 public constant BPS = 10_000;
 
-    /// @notice Categorises a {FeeCollected} event.
+    /// @notice Categorises a {FeeCollected} event. Only fees the vault retains
+    /// (open + close) — the liquidator reward leaves the vault and is reported
+    /// separately by {PositionLiquidated}.
     enum FeeKind {
         Open,
-        Close,
-        LiquidationReward
+        Close
     }
 
     /// @notice An open leveraged bet against the vault.
@@ -388,7 +389,6 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
 
         if (reward > 0) asset.safeTransfer(msg.sender, reward);
         emit PositionLiquidated(id, p.trader, msg.sender, markPrice, reward, vaultGain);
-        emit FeeCollected(id, FeeKind.LiquidationReward, reward);
     }
 
     /// @notice Live PnL + equity for a position, at the current (raw) oracle
