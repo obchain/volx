@@ -8,6 +8,8 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
+import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import { VolXOracle } from "./VolXOracle.sol";
 
 /// @title VolXPerp (LP vault portion)
 /// @notice gTrade-style shared collateral vault: a single pot of LP-supplied
@@ -23,16 +25,62 @@ import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 /// and so realized trader PnL can be credited/debited without a token move.
 contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
+    using SafeCast for uint256;
+    using SafeCast for int256;
 
     /// @notice The collateral token (MockUSDC, 6 decimals).
     IERC20 public immutable asset;
+
+    /// @notice Price source for entry/mark prices.
+    VolXOracle public immutable oracle;
 
     /// @dev Share token decimals, mirrored from the underlying asset.
     uint8 private immutable _assetDecimals;
 
     /// @dev Internal accounting of vault-managed collateral. Diverges from
-    /// `asset.balanceOf(this)` by exactly any donated tokens (ignored on purpose).
+    /// `asset.balanceOf(this)` by exactly any donated tokens + open trader
+    /// collateral (held but not LP-owned); both ignored on purpose.
     uint256 internal _totalAssets;
+
+    /// @notice Max leverage a trader may open (demo default 10x).
+    uint256 public constant MAX_LEVERAGE = 10;
+
+    /// @notice Open fee in basis points (0.1%).
+    uint256 public constant OPEN_FEE_BPS = 10;
+
+    /// @notice Close fee in basis points (0.1%).
+    uint256 public constant CLOSE_FEE_BPS = 10;
+
+    /// @notice Basis-point denominator.
+    uint256 public constant BPS = 10_000;
+
+    /// @notice An open leveraged bet against the vault.
+    /// @param trader position owner
+    /// @param index which volatility index the bet tracks
+    /// @param isLong true = profits when the index rises
+    /// @param collateral working collateral after the open fee (6dp)
+    /// @param leverage integer leverage in [1, MAX_LEVERAGE]
+    /// @param entryPrice oracle value at open (1e8 scale)
+    /// @param openedAt unix seconds at open
+    struct Position {
+        address trader;
+        VolXOracle.Index index;
+        bool isLong;
+        uint256 collateral;
+        uint256 leverage;
+        uint256 entryPrice;
+        uint256 openedAt;
+    }
+
+    /// @notice id => position. `trader == address(0)` means absent.
+    mapping(uint256 => Position) public positions;
+
+    /// @notice Next position id to assign (monotonic).
+    uint256 public nextPositionId;
+
+    /// @notice Sum of open-position notional — collateral reserved against the
+    /// vault so LPs cannot withdraw collateral that may be owed to traders.
+    uint256 public totalReserved;
 
     error ZeroAssets();
     error ZeroShares();
@@ -40,14 +88,40 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
     error InsufficientShares(uint256 have, uint256 want);
     error WithdrawExceedsAvailable(uint256 requested, uint256 available);
     error VaultInsolvent();
+    error ZeroCollateral();
+    error InvalidLeverage(uint256 leverage);
+    error CollateralBelowOpenFee(uint256 collateral, uint256 openFee);
+    error PositionNotFound(uint256 id);
+    error NotPositionOwner(address caller, address owner);
 
     event Deposit(address indexed caller, uint256 assets, uint256 shares);
     event Withdraw(address indexed caller, uint256 assets, uint256 shares);
+    event PositionOpened(
+        uint256 indexed id,
+        address indexed trader,
+        VolXOracle.Index indexed index,
+        bool isLong,
+        uint256 collateral,
+        uint256 leverage,
+        uint256 entryPrice,
+        uint256 notional,
+        uint256 openFee
+    );
+    event PositionClosed(
+        uint256 indexed id,
+        address indexed trader,
+        uint256 markPrice,
+        int256 pnl,
+        uint256 payout,
+        uint256 closeFee
+    );
 
     /// @param asset_ collateral token (must expose `decimals()`)
-    constructor(IERC20 asset_) ERC20("VolX LP", "vxLP") Ownable(msg.sender) {
-        if (address(asset_) == address(0)) revert ZeroAddress();
+    /// @param oracle_ price source
+    constructor(IERC20 asset_, VolXOracle oracle_) ERC20("VolX LP", "vxLP") Ownable(msg.sender) {
+        if (address(asset_) == address(0) || address(oracle_) == address(0)) revert ZeroAddress();
         asset = asset_;
+        oracle = oracle_;
         _assetDecimals = IERC20Metadata(address(asset_)).decimals();
     }
 
@@ -62,11 +136,10 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
         return _totalAssets;
     }
 
-    /// @notice Collateral currently reserved against open interest and therefore
-    /// not withdrawable by LPs. Stub returns 0 here; #89/#90 override with the
-    /// real open-interest margin reserve.
+    /// @notice Collateral reserved against open interest (sum of open notional)
+    /// and therefore not withdrawable by LPs.
     function reservedAssets() public view virtual returns (uint256) {
-        return 0;
+        return totalReserved;
     }
 
     /// @notice Collateral free for LP withdrawal: `totalAssets - reservedAssets`.
@@ -154,5 +227,110 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
     /// position tries to pay more than the vault holds. See the INVARIANT note.
     function _decreaseTotalAssets(uint256 amount) internal {
         _totalAssets -= amount;
+    }
+
+    // --- positions ----------------------------------------------------------
+
+    /// @notice Open a leveraged bet on `index`. Pulls `collateral`, records the
+    /// oracle price as entry, charges the open fee to the vault, and reserves the
+    /// notional. Reverts if the oracle is stale/unset (via {VolXOracle.getPriceChecked}).
+    /// @param index volatility index to bet on
+    /// @param isLong true to profit on a rise, false on a fall
+    /// @param collateral collateral to post (6dp); must exceed the open fee
+    /// @param leverage integer leverage in [1, MAX_LEVERAGE]
+    /// @return id the new position id
+    function openPosition(VolXOracle.Index index, bool isLong, uint256 collateral, uint256 leverage)
+        external
+        nonReentrant
+        returns (uint256 id)
+    {
+        if (collateral == 0) revert ZeroCollateral();
+        if (leverage == 0 || leverage > MAX_LEVERAGE) revert InvalidLeverage(leverage);
+
+        (uint64 price,,) = oracle.getPriceChecked(index); // reverts if stale/unset
+        uint256 entryPrice = uint256(price);
+
+        uint256 openFee = Math.mulDiv(collateral * leverage, OPEN_FEE_BPS, BPS);
+        if (collateral <= openFee) revert CollateralBelowOpenFee(collateral, openFee);
+
+        uint256 working = collateral - openFee;
+        uint256 notional = working * leverage;
+
+        id = nextPositionId++;
+        positions[id] = Position({
+            trader: msg.sender,
+            index: index,
+            isLong: isLong,
+            collateral: working,
+            leverage: leverage,
+            entryPrice: entryPrice,
+            openedAt: block.timestamp
+        });
+        totalReserved += notional;
+        _increaseTotalAssets(openFee); // fee tokens arrive with the pull below
+
+        asset.safeTransferFrom(msg.sender, address(this), collateral);
+        emit PositionOpened(
+            id, msg.sender, index, isLong, working, leverage, entryPrice, notional, openFee
+        );
+    }
+
+    /// @notice Close your position, settling PnL against the vault. Loss is
+    /// capped at collateral; a win is paid from the vault. Charges the close fee.
+    /// @param id position id (must be owned by the caller)
+    function closePosition(uint256 id) external nonReentrant {
+        Position memory p = positions[id];
+        if (p.trader == address(0)) revert PositionNotFound(id);
+        if (p.trader != msg.sender) revert NotPositionOwner(msg.sender, p.trader);
+
+        (uint64 mark,,) = oracle.getPriceChecked(p.index);
+        uint256 markPrice = uint256(mark);
+        uint256 notional = p.collateral * p.leverage;
+        int256 pnl = _pnl(p, markPrice, notional);
+
+        // Trader can never lose more than collateral; upside is uncapped (bounded
+        // by vault solvency, which the reserve protects against).
+        int256 raw = p.collateral.toInt256() + pnl;
+        uint256 payoutBeforeFee = raw > 0 ? raw.toUint256() : 0;
+        uint256 closeFee = Math.min(Math.mulDiv(notional, CLOSE_FEE_BPS, BPS), payoutBeforeFee);
+        uint256 payout = payoutBeforeFee - closeFee;
+
+        // Net token movement vs the vault: the position held `p.collateral`; the
+        // difference to `payout` is the vault's gain (loss+fees) or its outlay (win).
+        if (p.collateral >= payout) {
+            _increaseTotalAssets(p.collateral - payout);
+        } else {
+            _decreaseTotalAssets(payout - p.collateral);
+        }
+
+        totalReserved -= notional;
+        delete positions[id];
+
+        if (payout > 0) asset.safeTransfer(p.trader, payout);
+        emit PositionClosed(id, p.trader, markPrice, pnl, payout, closeFee);
+    }
+
+    /// @notice Live PnL + equity for a position, at the current (raw) oracle
+    /// price. View helper for UIs; does not check staleness so it never reverts
+    /// on a momentarily stale feed.
+    /// @param id position id
+    /// @return pnl signed PnL (6dp)
+    /// @return equity collateral + pnl, floored at 0 (6dp)
+    function positionValue(uint256 id) external view returns (int256 pnl, uint256 equity) {
+        Position memory p = positions[id];
+        if (p.trader == address(0)) revert PositionNotFound(id);
+        (uint64 mark,,) = oracle.getPrice(p.index);
+        pnl = _pnl(p, uint256(mark), p.collateral * p.leverage);
+        int256 raw = p.collateral.toInt256() + pnl;
+        equity = raw > 0 ? raw.toUint256() : 0;
+    }
+
+    /// @dev Signed PnL = notional * (mark - entry) / entry, negated for shorts.
+    /// `entryPrice` is guaranteed non-zero (the oracle rejects zero values).
+    function _pnl(Position memory p, uint256 mark, uint256 notional) private pure returns (int256) {
+        int256 entry = p.entryPrice.toInt256();
+        int256 diff = mark.toInt256() - entry;
+        int256 pnl = notional.toInt256() * diff / entry;
+        return p.isLong ? pnl : -pnl;
     }
 }

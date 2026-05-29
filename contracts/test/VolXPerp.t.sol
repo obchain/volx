@@ -6,10 +6,12 @@ import { MockUSDC } from "../src/MockUSDC.sol";
 import { VolXPerp } from "../src/VolXPerp.sol";
 import { VolXPerpHarness } from "./harness/VolXPerpHarness.sol";
 import { ReentrantToken } from "./mocks/ReentrantToken.sol";
+import { VolXOracle } from "../src/VolXOracle.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 contract VolXPerpTest is Test {
     MockUSDC internal usdc;
+    VolXOracle internal oracle;
     VolXPerpHarness internal vault;
 
     address internal alice = makeAddr("alice");
@@ -22,7 +24,8 @@ contract VolXPerpTest is Test {
 
     function setUp() public {
         usdc = new MockUSDC();
-        vault = new VolXPerpHarness(usdc);
+        oracle = new VolXOracle(address(this));
+        vault = new VolXPerpHarness(usdc, oracle);
         _fund(alice, 10_000 * ONE);
         _fund(bob, 10_000 * ONE);
     }
@@ -50,7 +53,7 @@ contract VolXPerpTest is Test {
 
     function test_ConstructorRejectsZeroAsset() public {
         vm.expectRevert(VolXPerp.ZeroAddress.selector);
-        new VolXPerpHarness(MockUSDC(address(0)));
+        new VolXPerpHarness(MockUSDC(address(0)), oracle);
     }
 
     // --- deposit ------------------------------------------------------------
@@ -218,7 +221,7 @@ contract VolXPerpTest is Test {
 
     function test_WithdrawIsReentrancyGuarded() public {
         ReentrantToken evil = new ReentrantToken();
-        VolXPerpHarness evilVault = new VolXPerpHarness(evil);
+        VolXPerpHarness evilVault = new VolXPerpHarness(evil, oracle);
         evil.setVault(address(evilVault));
 
         evil.mint(alice, 1000 * ONE);
