@@ -199,6 +199,50 @@ contract VolXPerpPositionsTest is Test {
         assertEq(perp.totalReserved(), 0);
     }
 
+    function test_LongProfitCappedAtNotional() public {
+        uint256 id = _open(alice, true, 1000 * ONE, 5);
+        uint256 balAfterOpen = usdc.balanceOf(alice);
+
+        _setBvol(240e8); // +300% -> raw pnl 3x notional, must cap at notional
+
+        vm.prank(alice);
+        perp.closePosition(id);
+
+        // working 995, notional 4975; gain capped at 4975, closeFee 4.975.
+        uint256 expectedPayout = (995 * ONE) + (4975 * ONE) - (4975 * ONE / 1000);
+        assertEq(usdc.balanceOf(alice) - balAfterOpen, expectedPayout);
+    }
+
+    function test_LongProfitCapKeepsVaultSolventAfterLpDrain() public {
+        // Reproduces the reserve-floor edge: LP drains to the reserve floor, then
+        // a winning long closes at >2x. With the profit cap this must NOT revert.
+        uint256 id = _open(alice, true, 100_000 * ONE, 10); // notional 990,000
+
+        uint256 lpShares = perp.balanceOf(lp);
+        uint256 available = perp.availableAssets();
+        // Withdraw the LP down to the reserve floor (shares worth `available`).
+        uint256 sharesToPull = perp.convertToShares(available);
+        if (sharesToPull > lpShares) sharesToPull = lpShares;
+        vm.prank(lp);
+        perp.withdraw(sharesToPull);
+
+        _setBvol(240e8); // 4x
+
+        vm.prank(alice);
+        perp.closePosition(id); // would revert pre-cap; passes with cap
+        assertEq(perp.totalReserved(), 0);
+    }
+
+    function test_PositionValueDoesNotRevertWhenStale() public {
+        uint256 id = _open(alice, true, 1000 * ONE, 5);
+        vm.warp(block.timestamp + oracle.MAX_STALENESS() + 100); // stale
+
+        // No price move since open -> pnl 0, equity == working. No revert.
+        (int256 pnl, uint256 equity) = perp.positionValue(id);
+        assertEq(pnl, 0);
+        assertEq(equity, 995 * ONE);
+    }
+
     // --- fees ---------------------------------------------------------------
 
     function test_CloseAtSamePriceChargesOnlyFees() public {
