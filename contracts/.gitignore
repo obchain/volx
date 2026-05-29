@@ -8,6 +8,7 @@ broadcast/
 # Coverage / gas snapshots are opt-in per run
 lcov.info
 *.lcov
+.gas-snapshot
 
 # Env / secrets — testnet keys live in repo-root .secrets/ (gitignored there too)
 .env
