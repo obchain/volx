@@ -25,7 +25,7 @@ runs = 256
 
 [invariant]
 runs = 64
-depth = 32
+depth = 128              # deep enough for multi-step open->crash->liquidate->withdraw paths
 fail_on_revert = false   # handler wraps actions in try/catch; explore valid states
 
 [fmt]
