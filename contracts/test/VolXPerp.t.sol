@@ -149,6 +149,17 @@ contract VolXPerpTest is Test {
         assertEq(assets, 600 * ONE);
     }
 
+    function test_WithdrawRoundingToZeroReverts() public {
+        // supply 3, _totalAssets 1 -> convertToAssets(1) floors to 0.
+        vm.prank(alice);
+        vault.deposit(3);
+        vault.debitVault(2); // accounting now 1, supply 3
+
+        vm.prank(alice);
+        vm.expectRevert(VolXPerp.ZeroAssets.selector);
+        vault.withdraw(1);
+    }
+
     // --- reserve guard ------------------------------------------------------
 
     function test_CannotWithdrawReservedCollateral() public {
