@@ -251,6 +251,9 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
         uint256 entryPrice = uint256(price);
 
         uint256 openFee = Math.mulDiv(collateral * leverage, OPEN_FEE_BPS, BPS);
+        // Defensive: unreachable at current constants (max fee = leverage*0.1% =
+        // 1% of collateral), but guards `collateral - openFee` if MAX_LEVERAGE or
+        // OPEN_FEE_BPS is ever raised.
         if (collateral <= openFee) revert CollateralBelowOpenFee(collateral, openFee);
 
         uint256 working = collateral - openFee;
@@ -267,9 +270,12 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
             openedAt: block.timestamp
         });
         totalReserved += notional;
-        _increaseTotalAssets(openFee); // fee tokens arrive with the pull below
 
+        // Pull collateral in BEFORE crediting the fee, per the hook invariant
+        // (tokens must back the accounting bump).
         asset.safeTransferFrom(msg.sender, address(this), collateral);
+        _increaseTotalAssets(openFee);
+
         emit PositionOpened(
             id, msg.sender, index, isLong, working, leverage, entryPrice, notional, openFee
         );
@@ -288,8 +294,8 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
         uint256 notional = p.collateral * p.leverage;
         int256 pnl = _pnl(p, markPrice, notional);
 
-        // Trader can never lose more than collateral; upside is uncapped (bounded
-        // by vault solvency, which the reserve protects against).
+        // Trader can never lose more than collateral (raw floored at 0 below);
+        // gain is capped at notional inside _pnl so the reserve always covers it.
         int256 raw = p.collateral.toInt256() + pnl;
         uint256 payoutBeforeFee = raw > 0 ? raw.toUint256() : 0;
         uint256 closeFee = Math.min(Math.mulDiv(notional, CLOSE_FEE_BPS, BPS), payoutBeforeFee);
@@ -325,12 +331,19 @@ contract VolXPerp is ERC20, ReentrancyGuard, Ownable {
         equity = raw > 0 ? raw.toUint256() : 0;
     }
 
-    /// @dev Signed PnL = notional * (mark - entry) / entry, negated for shorts.
-    /// `entryPrice` is guaranteed non-zero (the oracle rejects zero values).
+    /// @dev Signed PnL = notional * (mark - entry) / entry, negated for shorts,
+    /// then capped at +notional. The cap bounds a winning long's payout (raw
+    /// upside is unbounded as the index rises) to the reserve set aside
+    /// (`notional`), keeping the vault solvent by construction even after LPs
+    /// withdraw down to the reserve floor. A short's raw maximum (at mark=0) is
+    /// already exactly +notional, so the cap is a no-op for shorts — gain
+    /// treatment is symmetric. `entryPrice` is non-zero (oracle rejects 0).
     function _pnl(Position memory p, uint256 mark, uint256 notional) private pure returns (int256) {
         int256 entry = p.entryPrice.toInt256();
         int256 diff = mark.toInt256() - entry;
         int256 pnl = notional.toInt256() * diff / entry;
-        return p.isLong ? pnl : -pnl;
+        if (!p.isLong) pnl = -pnl;
+        int256 cap = notional.toInt256();
+        return pnl > cap ? cap : pnl;
     }
 }
