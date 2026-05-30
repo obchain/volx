@@ -445,6 +445,18 @@ acceptance criterion for engine correctness (#21).
 
 ---
 
+## 8a. On-chain layer (testnet)
+
+A tradeable layer exists on Ethereum Sepolia (a synthetic volatility perp; see
+[`docs/onchain-demo.md`](docs/onchain-demo.md)). It does **not** change the index
+methodology: the on-chain `VolXOracle` value is **authoritative from this
+off-chain engine** — there is no on-chain VIX math. An off-chain keeper pushes
+the engine's published index value (scaled to 1e8) on a deviation/heartbeat rule.
+The perp, vault, and oracle are a **testnet demo, not audited**, with no funding
+rate in v1. Nothing in this layer feeds back into the index computation.
+
+---
+
 ## 9. Versioning
 
 This methodology is `0.1.0`. Versions follow semver. Any change that
