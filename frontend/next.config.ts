@@ -18,9 +18,8 @@ const API_TARGET = process.env.API_PROXY_TARGET ?? "http://127.0.0.1:8090";
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
-  experimental: {
-    typedRoutes: true,
-  },
+  // Moved out of `experimental` in Next 15.5.
+  typedRoutes: true,
   async rewrites() {
     return [
       {
