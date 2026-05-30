@@ -96,6 +96,32 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm build
 
+  keeper:
+    name: keeper (typecheck + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: keeper
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm 10 honours the `allowBuilds` decision in pnpm-workspace.yaml
+      # (esbuild's postinstall), so install doesn't fail on ignored scripts.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "10.6.0"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: keeper/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+
   # ---------------------------------------------------------------------------
   # Integration: full local pipeline via scripts/e2e-smoke.sh.
   #
