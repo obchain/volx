@@ -85,9 +85,14 @@ function PoolInner() {
   }, [account, publicClient]);
 
   useEffect(() => {
-    refresh();
-    const t = setInterval(refresh, 12_000);
-    return () => clearInterval(t);
+    let alive = true;
+    const run = () => alive && refresh();
+    run();
+    const t = setInterval(run, 12_000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
   }, [refresh]);
 
   const send = useCallback(

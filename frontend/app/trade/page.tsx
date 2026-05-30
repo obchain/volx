@@ -6,7 +6,7 @@ import { Header } from "@/components/Header";
 import { Footer } from "@/components/Footer";
 import { WalletButton, NetworkGuard, Card, Stat, TxButton, cleanErr } from "@/components/dapp";
 import { useWallet } from "@/lib/wallet";
-import { ADDRESSES, INDEX, type IndexKey, mockUsdcAbi, perpAbi } from "@/lib/contracts";
+import { ADDRESSES, BPS, INDEX, type IndexKey, MAX_LEVERAGE, mockUsdcAbi, OPEN_FEE_BPS, perpAbi } from "@/lib/contracts";
 import { fmtPnl, fmtPrice, fmtUsdc, parseUsdc } from "@/lib/format";
 import {
   readOracle,
@@ -70,9 +70,14 @@ function TradeInner() {
   }, [account, publicClient]);
 
   useEffect(() => {
-    refresh();
-    const t = setInterval(refresh, 12_000);
-    return () => clearInterval(t);
+    let alive = true;
+    const run = () => alive && refresh();
+    run();
+    const t = setInterval(run, 12_000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
   }, [refresh]);
 
   const send = useCallback(
@@ -98,7 +103,11 @@ function TradeInner() {
     collateralUnits = 0n;
   }
   const needsApproval = !!bal && collateralUnits > 0n && bal.allowance < collateralUnits;
-  const notional = collateralUnits * BigInt(leverage);
+  // Mirror the on-chain open fee (collateral × lev × 0.1%): the contract reserves
+  // notional on the post-fee working collateral, so the displayed value matches.
+  const openFee = (collateralUnits * BigInt(leverage) * OPEN_FEE_BPS) / BPS;
+  const working = collateralUnits > openFee ? collateralUnits - openFee : 0n;
+  const notional = working * BigInt(leverage);
 
   const faucet = () =>
     send(() => walletClient.writeContract({ address: ADDRESSES.mockUSDC, abi: mockUsdcAbi, functionName: "faucet", chain: walletClient.chain, account }));
@@ -148,7 +157,7 @@ function TradeInner() {
               <label className="text-[10px] font-medium uppercase tracking-[0.16em] text-soft">Leverage</label>
               <span className="font-mono text-sm font-semibold text-accent">{leverage}×</span>
             </div>
-            <input type="range" min={1} max={10} value={leverage} onChange={(e) => setLeverage(Number(e.target.value))} className="mt-2 w-full accent-[var(--accent)]" />
+            <input type="range" min={1} max={MAX_LEVERAGE} value={leverage} onChange={(e) => setLeverage(Number(e.target.value))} className="mt-2 w-full accent-[var(--accent)]" />
           </div>
 
           {/* Summary */}
