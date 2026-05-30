@@ -14,6 +14,8 @@ optimizer_runs = 200
 # Treat warnings as errors so dead code / shadowing can't accrue.
 deny = "warnings"
 # Remappings live in remappings.txt (single source of truth).
+# Deploy script writes deployments/sepolia.json for keeper + frontend to consume.
+fs_permissions = [{ access = "read-write", path = "./deployments" }]
 
 [lint]
 # Purely stylistic; conflicts with the deliberate ERC4626-style lowercase

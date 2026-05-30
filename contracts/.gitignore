@@ -5,6 +5,10 @@ cache/
 # Deploy broadcast logs (per-chain run records; regenerated on deploy)
 broadcast/
 
+# deployments/<chain>.json is intentionally TRACKED — it is the canonical
+# address source the keeper (#93) and frontend (#94) read. Only broadcast/ above
+# (which can contain raw tx data) is ignored; the curated JSON is committed.
+
 # Coverage / gas snapshots are opt-in per run
 lcov.info
 *.lcov
