@@ -67,8 +67,17 @@ export interface ErrorFrame {
 
 export type WsFrame = TickFrame | ErrorFrame;
 
+// When the API is reached through an ngrok free tunnel, the agent serves
+// an HTML interstitial warning page to browser-looking requests, which
+// breaks JSON parsing. Sending this header (any value) skips it. Harmless
+// against the direct local API. Forwarded upstream by the Next rewrite.
+const REST_HEADERS = { "ngrok-skip-browser-warning": "true" } as const;
+
 export async function fetchLatest(id: IndexId): Promise<LatestResponse> {
-  const r = await fetch(`/v1/index/${id}/latest`, { cache: "no-store" });
+  const r = await fetch(`/v1/index/${id}/latest`, {
+    cache: "no-store",
+    headers: REST_HEADERS,
+  });
   if (!r.ok) throw new Error(`latest ${id}: ${r.status}`);
   return (await r.json()) as LatestResponse;
 }
@@ -79,7 +88,7 @@ export async function fetchHistory(
   limit: number,
 ): Promise<HistoryResponse> {
   const url = `/v1/index/${id}/history?interval=${interval}&limit=${limit}`;
-  const r = await fetch(url, { cache: "no-store" });
+  const r = await fetch(url, { cache: "no-store", headers: REST_HEADERS });
   if (!r.ok) throw new Error(`history ${id}: ${r.status}`);
   return (await r.json()) as HistoryResponse;
 }
