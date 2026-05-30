@@ -85,6 +85,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const connect = useCallback(async () => {
+    if (typeof window === "undefined") return;
     const eth = window.ethereum;
     if (!eth) {
       window.open("https://metamask.io/download/", "_blank");
@@ -102,6 +103,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const switchToSepolia = useCallback(async () => {
+    if (typeof window === "undefined") return;
     const eth = window.ethereum;
     if (!eth) return;
     try {

@@ -19,6 +19,11 @@ export const READ_RPC_URL =
 export const VALUE_SCALE = 100_000_000n; // 1e8
 export const USDC_DECIMALS = 6;
 
+// Perp constants, mirrored from VolXPerp.
+export const MAX_LEVERAGE = 10;
+export const OPEN_FEE_BPS = 10n;
+export const BPS = 10_000n;
+
 /** VolXOracle.Index */
 export const INDEX = { bvol: 0, evol: 1 } as const;
 export type IndexKey = keyof typeof INDEX;

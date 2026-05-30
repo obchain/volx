@@ -67,7 +67,7 @@ export interface UserPosition {
   collateral: bigint;
   leverage: bigint;
   entryPrice: bigint;
-  pnl: bigint;
+  pnl: bigint; // signed — may be negative (int256)
   equity: bigint;
   liquidatable: boolean;
 }
@@ -90,19 +90,29 @@ export async function readPositions(client: PublicClient, account: Address): Pro
     .filter(({ p }) => (p[0] as Address).toLowerCase() === account.toLowerCase());
   if (mine.length === 0) return [];
 
+  // allowFailure so a position closed/liquidated between the two multicalls
+  // (positionValue then reverts PositionNotFound) drops out instead of throwing
+  // and freezing the whole list.
   const values = await client.multicall({
-    allowFailure: false,
+    allowFailure: true,
     contracts: mine.flatMap(({ id }) => [
       { ...perp, functionName: "positionValue" as const, args: [id] },
       { ...perp, functionName: "isLiquidatable" as const, args: [id] },
     ]),
   });
 
-  return mine.map(({ p, id }, k) => {
-    const [pnl, equity] = values[k * 2] as readonly [bigint, bigint];
-    const liquidatable = values[k * 2 + 1] as boolean;
-    return {
-      id,
+  const out: UserPosition[] = [];
+  for (let k = 0; k < mine.length; k++) {
+    const item = mine[k];
+    if (!item) continue;
+    const pv = values[k * 2];
+    if (!pv || pv.status === "failure") continue; // position no longer exists
+    const liq = values[k * 2 + 1];
+    const [pnl, equity] = pv.result as readonly [bigint /* int256, signed */, bigint];
+    const liquidatable = liq && liq.status === "success" ? (liq.result as boolean) : false;
+    const p = item.p;
+    out.push({
+      id: item.id,
       index: Number(p[1]) === INDEX.bvol ? "bvol" : "evol",
       isLong: p[2] as boolean,
       collateral: p[3] as bigint,
@@ -111,6 +121,7 @@ export async function readPositions(client: PublicClient, account: Address): Pro
       pnl,
       equity,
       liquidatable,
-    };
-  });
+    });
+  }
+  return out;
 }
