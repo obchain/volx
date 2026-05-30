@@ -43,6 +43,12 @@ export function Header() {
 
         {/* Right: nav + theme */}
         <nav className="flex items-center gap-1">
+          <NavLink href="/trade" active={pathname === "/trade"}>
+            trade
+          </NavLink>
+          <NavLink href="/pool" active={pathname === "/pool"}>
+            pool
+          </NavLink>
           <NavLink href="/methodology" active={pathname === "/methodology"}>
             methodology
           </NavLink>
