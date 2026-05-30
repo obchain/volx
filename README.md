@@ -575,6 +575,34 @@ VolX is in active development.
 
 ---
 
+## On-chain perp (testnet demo)
+
+Beyond publishing the index, VolX ships a **tradeable layer** on Ethereum
+Sepolia — the same move Volmex made with BVIV/EVIV perps, but open-source and
+self-hostable end to end. A gTrade-style synthetic perp lets traders take
+leveraged long/short positions on BVOL/EVOL; one shared LP vault is the
+counterparty, an off-chain keeper pushes the live index on-chain, and positions
+settle against the vault.
+
+- **MockUSDC** (6dp test collateral, faucet) · **VolXOracle** (keeper-pushed,
+  packed price + staleness guard) · **VolXPerp** (ERC4626-style LP vault +
+  leveraged positions + liquidation + fees).
+- 10× max leverage · 80% liquidation · 0.1% open/close fee · **no funding rate**
+  (v1) · loss capped at collateral, winning-long gain capped at notional, so the
+  vault is solvent against its reserve by construction.
+- A keeper (TS + viem) pushes on 0.5% deviation / 30m heartbeat; a Next.js
+  `/trade` + `/pool` UI makes it clickable.
+
+A full vertical — keeper push → open long + short → price move → profitable close
+→ liquidation → LP fee yield — has been run live on Sepolia with verified
+contracts and recorded tx hashes.
+
+> **Testnet only, not audited, demo liquidity.** See
+> [`docs/onchain-demo.md`](./docs/onchain-demo.md) for addresses, run
+> instructions, the live e2e tx log, and gas notes.
+
+---
+
 ## Roadmap
 
 High-level landmarks:
