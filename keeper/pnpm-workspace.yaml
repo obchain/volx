@@ -1,0 +1,5 @@
+# tsx pulls esbuild, which has a postinstall that fetches its platform binary.
+# Allow just that build so `pnpm install` / `pnpm run` don't fail on ignored
+# build scripts (this pnpm keys the decision under `allowBuilds`).
+allowBuilds:
+  esbuild: true
