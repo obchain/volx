@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
 import { ThemeProvider, themeInitScript } from "@/lib/theme";
 import { WalletProvider } from "@/lib/wallet";
+import { IndexTicksProvider } from "@/lib/useIndexTicks";
 import "./globals.css";
 
 const inter = Inter({
@@ -34,7 +35,9 @@ export default function RootLayout({
       </head>
       <body className="bg-background text-foreground antialiased">
         <ThemeProvider>
-          <WalletProvider>{children}</WalletProvider>
+          <WalletProvider>
+            <IndexTicksProvider>{children}</IndexTicksProvider>
+          </WalletProvider>
         </ThemeProvider>
       </body>
     </html>
