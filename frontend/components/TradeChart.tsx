@@ -11,6 +11,22 @@ import { useTheme } from "@/lib/theme";
 import { readChartTheme } from "./Chart";
 import { DEFAULT_TIMEFRAME, TIMEFRAMES, TIMEFRAME_SPEC, type Timeframe } from "@/lib/timeframes";
 import { LivePulse } from "./LivePulse";
+import { liqPriceVol } from "@/lib/perp";
+
+/** An open position to overlay (entry + liquidation lines) on the chart. */
+export interface ChartPosition {
+  id: string;
+  isLong: boolean;
+  leverage: number;
+  entry: number; // index vol points
+}
+
+/** The order being configured — draws a hypothetical liquidation line at the
+ * current mark so the trader sees the risk before opening. */
+export interface ChartPreview {
+  isLong: boolean;
+  leverage: number;
+}
 
 echarts.use([
   CandlestickChart,
@@ -27,7 +43,15 @@ const NAME: Record<IndexId, string> = { bvol: "Bitcoin Volatility", evol: "Ether
 /** Compact price chart for the trade ticket — shares the index data plumbing
  * (history + live WS) with the full /chart view but renders a lean
  * candles-only panel that sits beside the order form. */
-export function TradeChart({ id }: { id: IndexId }) {
+export function TradeChart({
+  id,
+  positions = [],
+  preview = null,
+}: {
+  id: IndexId;
+  positions?: ChartPosition[];
+  preview?: ChartPreview | null;
+}) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<echarts.ECharts | null>(null);
   const barsRef = useRef<HistoryBar[]>([]);
@@ -59,6 +83,51 @@ export function TradeChart({ id }: { id: IndexId }) {
       const closes = bars.map((b) => b.close);
       const labels = bars.map((b) => b.ts);
       const last = closes[closes.length - 1];
+
+      // Build the overlay lines: current mark, each open position's entry +
+      // liquidation, and a hypothetical liq line for the order being sized.
+      type MarkItem = Record<string, unknown>;
+      const lbl = (text: string, color: string, bg: string, border: string, pos: string): MarkItem => ({
+        formatter: text,
+        color,
+        backgroundColor: bg,
+        borderColor: border,
+        borderWidth: 1,
+        padding: [2, 5],
+        borderRadius: 4,
+        fontSize: 10,
+        fontWeight: 700,
+        position: pos,
+      });
+      const markLineData: MarkItem[] = [];
+      if (last !== undefined) {
+        markLineData.push({
+          yAxis: last,
+          lineStyle: { color: t.lineColor, type: "dashed", width: 1, opacity: 0.7 },
+          label: lbl(last.toFixed(2), t.textStrong, t.tooltipBg, t.tooltipBorder, "insideEndTop"),
+        });
+      }
+      for (const p of positions) {
+        const c = p.isLong ? t.up : t.down;
+        markLineData.push({
+          yAxis: p.entry,
+          lineStyle: { color: c, type: "solid", width: 1.5, opacity: 0.9 },
+          label: lbl(`${p.isLong ? "L" : "S"}${p.leverage}× entry`, "#fff", c, c, "insideStartTop"),
+        });
+        markLineData.push({
+          yAxis: liqPriceVol(p.entry, p.leverage, p.isLong),
+          lineStyle: { color: t.down, type: "dashed", width: 1.2, opacity: 0.85 },
+          label: lbl("liq", t.down, t.tooltipBg, t.down, "insideStartBottom"),
+        });
+      }
+      if (preview && last !== undefined) {
+        markLineData.push({
+          yAxis: liqPriceVol(last, preview.leverage, preview.isLong),
+          lineStyle: { color: t.ema, type: "dashed", width: 1.2, opacity: 0.75 },
+          label: lbl(`liq @${preview.leverage}×`, t.ema, t.tooltipBg, t.tooltipBorder, "insideEndBottom"),
+        });
+      }
+
       chartRef.current.setOption(
         {
           animation: true,
@@ -135,34 +204,16 @@ export function TradeChart({ id }: { id: IndexId }) {
               itemStyle: { color: t.up, color0: t.down, borderColor: t.up, borderColor0: t.down, borderWidth: 1 },
               barMaxWidth: 10,
               z: 2,
-              markLine:
-                last !== undefined
-                  ? {
-                      symbol: "none",
-                      silent: true,
-                      lineStyle: { color: t.lineColor, type: "dashed", width: 1, opacity: 0.7 },
-                      label: {
-                        color: t.textStrong,
-                        backgroundColor: t.tooltipBg,
-                        borderColor: t.tooltipBorder,
-                        borderWidth: 1,
-                        padding: [2, 5],
-                        borderRadius: 4,
-                        fontSize: 10,
-                        fontWeight: 600,
-                        formatter: last.toFixed(2),
-                        position: "insideEndTop",
-                      },
-                      data: [{ yAxis: last }],
-                    }
-                  : undefined,
+              markLine: markLineData.length
+                ? { symbol: "none", silent: true, data: markLineData }
+                : undefined,
             },
           ],
         },
         true,
       );
     },
-    [id, theme],
+    [id, theme, positions, preview],
   );
 
   const drawRef = useRef(draw);
@@ -199,10 +250,10 @@ export function TradeChart({ id }: { id: IndexId }) {
     };
   }, [id, timeframe]);
 
-  // Redraw on theme flip.
+  // Redraw on theme flip or when the position / preview overlays change.
   useEffect(() => {
     if (barsRef.current.length > 0) drawRef.current(barsRef.current);
-  }, [theme]);
+  }, [theme, positions, preview]);
 
   // Live tick → patch last candle.
   useEffect(() => {
