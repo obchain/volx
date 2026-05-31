@@ -95,7 +95,7 @@ type ChartPalette = {
   ema: string;
 };
 
-function readChartTheme(theme: "dark" | "light"): ChartPalette {
+export function readChartTheme(theme: "dark" | "light"): ChartPalette {
   if (theme === "light") {
     return {
       up: "#16a34a",
