@@ -21,11 +21,14 @@ import {
 const STALE_SECS = 3600;
 
 export default function TradePage() {
+  // Lifted here so the chart + market toggle live ABOVE the wallet gate
+  // (index price is public — no wallet needed to view it).
+  const [index, setIndex] = useState<IndexKey>("bvol");
   return (
     <div className="flex min-h-dvh flex-col">
       <Header />
       <main className="mx-auto w-full max-w-6xl flex-1 px-5 py-8">
-        <div className="mb-6 flex items-center justify-between">
+        <div className="mb-5 flex items-end justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Trade volatility</h1>
             <p className="mt-1 text-sm text-muted">
@@ -34,8 +37,21 @@ export default function TradePage() {
           </div>
           <WalletButton />
         </div>
+
+        {/* Market picker + chart — always visible, drive the order ticket below. */}
+        <div className="mb-4 w-56">
+          <Segmented
+            value={index}
+            onChange={(v) => setIndex(v as IndexKey)}
+            options={[{ v: "bvol", l: "BVOL" }, { v: "evol", l: "EVOL" }]}
+          />
+        </div>
+        <div className="mb-6">
+          <TradeChart id={index} />
+        </div>
+
         <NetworkGuard>
-          <TradeInner />
+          <TradeInner index={index} />
         </NetworkGuard>
       </main>
       <Footer />
@@ -43,15 +59,14 @@ export default function TradePage() {
   );
 }
 
-function TradeInner() {
+function TradeInner({ index }: { index: IndexKey }) {
   const { account, publicClient, walletClient } = useWallet();
   const [prices, setPrices] = useState<Record<IndexKey, OraclePrice | null>>({ bvol: null, evol: null });
   const [bal, setBal] = useState<UserBalances | null>(null);
   const [positions, setPositions] = useState<UserPosition[]>([]);
   const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000));
 
-  // form
-  const [index, setIndex] = useState<IndexKey>("bvol");
+  // form (index is chosen by the market picker above)
   const [isLong, setIsLong] = useState(true);
   const [leverage, setLeverage] = useState(2);
   const [collateral, setCollateral] = useState("100");
@@ -126,17 +141,13 @@ function TradeInner() {
     <div className="grid gap-6 lg:grid-cols-[380px_1fr]">
       {/* Order form */}
       <div className="flex flex-col gap-4">
-        <Card title="Open position">
-          {/* Index */}
-          <Segmented value={index} onChange={(v) => setIndex(v as IndexKey)} options={[{ v: "bvol", l: "BVOL" }, { v: "evol", l: "EVOL" }]} />
+        <Card title={`Open ${index.toUpperCase()} position`}>
           {/* Side */}
-          <div className="mt-3">
-            <Segmented
-              value={isLong ? "long" : "short"}
-              onChange={(v) => setIsLong(v === "long")}
-              options={[{ v: "long", l: "Long ▲", color: "up" }, { v: "short", l: "Short ▼", color: "down" }]}
-            />
-          </div>
+          <Segmented
+            value={isLong ? "long" : "short"}
+            onChange={(v) => setIsLong(v === "long")}
+            options={[{ v: "long", l: "Long ▲", color: "up" }, { v: "short", l: "Short ▼", color: "down" }]}
+          />
 
           {/* Collateral */}
           <div className="mt-4">
@@ -194,10 +205,8 @@ function TradeInner() {
         </Card>
       </div>
 
-      {/* Positions + prices */}
+      {/* Positions */}
       <div className="flex flex-col gap-4">
-        <TradeChart id={index} />
-
         <Card title="Your positions">
           {positions.length === 0 ? (
             <p className="py-6 text-center text-sm text-soft">No open positions.</p>
