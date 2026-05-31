@@ -9,7 +9,25 @@
   <a href="./METHODOLOGY.md">Methodology</a> ·
   <a href="#quickstart">Quickstart</a> ·
   <a href="#api-planned">API</a> ·
-  <a href="#roadmap">Roadmap</a>
+  <a href="#roadmap">Roadmap</a> ·
+  <a href="./CHANGELOG.md">Changelog</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/obchain/volx/actions/workflows/ci.yml"><img src="https://github.com/obchain/volx/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/obchain/volx/actions/workflows/contracts.yml"><img src="https://github.com/obchain/volx/actions/workflows/contracts.yml/badge.svg" alt="Contracts"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://github.com/obchain/volx/releases"><img src="https://img.shields.io/github/v/release/obchain/volx?include_prereleases&sort=semver" alt="Release"></a>
+  <a href="https://volx-frontend-29824.netlify.app"><img src="https://img.shields.io/badge/demo-live-brightgreen.svg" alt="Live demo"></a>
+</p>
+
+<p align="center">
+  <b>Live testnet demo:</b>
+  <a href="https://volx-frontend-29824.netlify.app">app</a> ·
+  <a href="https://volx-frontend-29824.netlify.app/trade">trade</a> ·
+  <a href="https://volx-frontend-29824.netlify.app/pool">pool</a> ·
+  <a href="https://volx-frontend-29824.netlify.app/dashboard">dashboard</a>
+  &nbsp;—&nbsp; on Ethereum Sepolia. See <a href="./docs/onchain-demo.md">on-chain demo</a>.
 </p>
 
 ---
