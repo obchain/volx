@@ -89,8 +89,9 @@ export interface UserPosition {
   collateral: bigint;
   leverage: bigint;
   entryPrice: bigint;
-  pnl: bigint; // signed — may be negative (int256)
-  equity: bigint;
+  pnl: bigint; // signed — may be negative (int256); net of funding via equity
+  equity: bigint; // collateral + pnl - funding, floored 0
+  funding: bigint; // accrued borrow fee so far
   liquidatable: boolean;
 }
 
@@ -120,6 +121,7 @@ export async function readPositions(client: PublicClient, account: Address): Pro
     contracts: mine.flatMap(({ id }) => [
       { ...perp, functionName: "positionValue" as const, args: [id] },
       { ...perp, functionName: "isLiquidatable" as const, args: [id] },
+      { ...perp, functionName: "accruedFunding" as const, args: [id] },
     ]),
   });
 
@@ -127,11 +129,13 @@ export async function readPositions(client: PublicClient, account: Address): Pro
   for (let k = 0; k < mine.length; k++) {
     const item = mine[k];
     if (!item) continue;
-    const pv = values[k * 2];
+    const pv = values[k * 3];
     if (!pv || pv.status === "failure") continue; // position no longer exists
-    const liq = values[k * 2 + 1];
+    const liq = values[k * 3 + 1];
+    const fnd = values[k * 3 + 2];
     const [pnl, equity] = pv.result as readonly [bigint /* int256, signed */, bigint];
     const liquidatable = liq && liq.status === "success" ? (liq.result as boolean) : false;
+    const funding = fnd && fnd.status === "success" ? (fnd.result as bigint) : 0n;
     const p = item.p;
     out.push({
       id: item.id,
@@ -142,8 +146,59 @@ export async function readPositions(client: PublicClient, account: Address): Pro
       entryPrice: p[5] as bigint,
       pnl,
       equity,
+      funding,
       liquidatable,
     });
   }
   return out;
+}
+
+export type OrderKind = "limit" | "tp" | "sl";
+
+export interface OrderItem {
+  id: bigint;
+  kind: OrderKind;
+  index: IndexKey;
+  isLong: boolean;
+  collateral: bigint; // escrow (limit only)
+  leverage: bigint;
+  triggerPrice: bigint; // 1e8
+  triggerAbove: boolean;
+  positionId: bigint;
+}
+
+const ORDER_KIND: OrderKind[] = ["limit", "tp", "sl"];
+
+/** Scan [0, nextOrderId) for live orders owned by `account`. */
+export async function readOrders(client: PublicClient, account: Address): Promise<OrderItem[]> {
+  const next = await client.readContract({ address: ADDRESSES.perp, abi: perpAbi, functionName: "nextOrderId" });
+  const n = Number(next);
+  if (n === 0) return [];
+  const perp = { address: ADDRESSES.perp, abi: perpAbi } as const;
+  const rows = await client.multicall({
+    allowFailure: false,
+    contracts: Array.from({ length: n }, (_, i) => ({ ...perp, functionName: "orders" as const, args: [BigInt(i)] })),
+  });
+  const out: OrderItem[] = [];
+  rows.forEach((o, i) => {
+    const trader = o[0] as Address;
+    if (trader.toLowerCase() !== account.toLowerCase()) return; // includes the zero-address (consumed/cancelled) rows
+    out.push({
+      id: BigInt(i),
+      kind: ORDER_KIND[Number(o[1])] ?? "limit",
+      index: Number(o[2]) === INDEX.bvol ? "bvol" : "evol",
+      isLong: o[3] as boolean,
+      collateral: o[4] as bigint,
+      leverage: o[5] as bigint,
+      triggerPrice: o[6] as bigint,
+      triggerAbove: o[7] as boolean,
+      positionId: o[8] as bigint,
+    });
+  });
+  return out;
+}
+
+/** Current borrow-fee (funding) rate, in bps/day. */
+export async function readFundingRate(client: PublicClient): Promise<bigint> {
+  return client.readContract({ address: ADDRESSES.perp, abi: perpAbi, functionName: "fundingBpsPerDay" });
 }

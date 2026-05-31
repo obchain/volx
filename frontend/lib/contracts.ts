@@ -8,7 +8,7 @@ export const SEPOLIA_CHAIN_ID = 11155111;
 export const ADDRESSES = {
   mockUSDC: "0x60137f8457Db371EE4092c5F6C8e389168C582F5",
   oracle: "0x1762841A53F396B6C55eFbbB662D17A3B7Fa4947",
-  perp: "0x1BE8387f05d3556002683Fe0DE9131B15002b7fb",
+  perp: "0xc2f0dD6fCaCC29BB90D24dCF16bf95bc7D08BCBB", // VolXPerpV2 (funding + orders)
 } as const satisfies Record<string, Address>;
 
 /** Public read RPC (no wallet needed for stats). Overridable at build time. */
@@ -106,4 +106,54 @@ export const perpAbi = [
   },
   { type: "function", name: "closePosition", stateMutability: "nonpayable", inputs: [{ name: "id", type: "uint256" }], outputs: [] },
   { type: "function", name: "liquidate", stateMutability: "nonpayable", inputs: [{ name: "id", type: "uint256" }], outputs: [] },
+  // --- v2: funding ---
+  { type: "function", name: "fundingBpsPerDay", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
+  { type: "function", name: "accruedFunding", stateMutability: "view", inputs: [{ name: "id", type: "uint256" }], outputs: [{ type: "uint256" }] },
+  // --- v2: conditional orders ---
+  { type: "function", name: "nextOrderId", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
+  {
+    type: "function",
+    name: "orders",
+    stateMutability: "view",
+    inputs: [{ name: "id", type: "uint256" }],
+    outputs: [
+      { name: "trader", type: "address" },
+      { name: "kind", type: "uint8" }, // 0 LimitOpen, 1 TakeProfit, 2 StopLoss
+      { name: "index", type: "uint8" },
+      { name: "isLong", type: "bool" },
+      { name: "collateral", type: "uint256" },
+      { name: "leverage", type: "uint256" },
+      { name: "triggerPrice", type: "uint256" },
+      { name: "triggerAbove", type: "bool" },
+      { name: "positionId", type: "uint256" },
+    ],
+  },
+  {
+    type: "function",
+    name: "placeLimitOpen",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "index", type: "uint8" },
+      { name: "isLong", type: "bool" },
+      { name: "collateral", type: "uint256" },
+      { name: "leverage", type: "uint256" },
+      { name: "triggerPrice", type: "uint256" },
+      { name: "triggerAbove", type: "bool" },
+    ],
+    outputs: [{ name: "id", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "placeStop",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "positionId", type: "uint256" },
+      { name: "triggerPrice", type: "uint256" },
+      { name: "triggerAbove", type: "bool" },
+      { name: "takeProfit", type: "bool" },
+    ],
+    outputs: [{ name: "id", type: "uint256" }],
+  },
+  { type: "function", name: "cancelOrder", stateMutability: "nonpayable", inputs: [{ name: "id", type: "uint256" }], outputs: [] },
+  { type: "function", name: "executeOrder", stateMutability: "nonpayable", inputs: [{ name: "id", type: "uint256" }], outputs: [{ type: "uint256" }] },
 ] as const;
