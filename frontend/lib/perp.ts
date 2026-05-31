@@ -1,6 +1,28 @@
 import type { Address, PublicClient } from "viem";
 import { ADDRESSES, INDEX, type IndexKey, mockUsdcAbi, oracleAbi, perpAbi } from "./contracts";
 
+/// Liquidation loss threshold as a fraction of collateral (VolXPerp
+/// LIQ_THRESHOLD_BPS = 8000 = 80%).
+export const LIQ_THRESHOLD = 0.8;
+
+/// Price (in index vol points) at which a position becomes liquidatable.
+/// Derived from the contract rule: liquidatable once unrealized loss >=
+/// LIQ_THRESHOLD * collateral. Loss = notional*|move|/entry and
+/// notional = collateral*leverage, so collateral cancels and the trigger is
+/// a pure function of entry, leverage and side:
+///   long:  mark = entry * (1 - 0.8/leverage)
+///   short: mark = entry * (1 + 0.8/leverage)
+export function liqPriceVol(entryVol: number, leverage: number, isLong: boolean): number {
+  if (leverage <= 0) return entryVol;
+  const move = LIQ_THRESHOLD / leverage;
+  return isLong ? entryVol * (1 - move) : entryVol * (1 + move);
+}
+
+/// Convert an oracle/entry value (1e8 fixed-point bigint) to a vol-points number.
+export function toVol(value1e8: bigint): number {
+  return Number(value1e8) / 1e8;
+}
+
 export interface OraclePrice {
   value: bigint; // 1e8
   updatedAt: bigint; // unix seconds; 0 = never set
