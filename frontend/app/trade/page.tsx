@@ -5,6 +5,7 @@ import type { Hex } from "viem";
 import { Header } from "@/components/Header";
 import { Footer } from "@/components/Footer";
 import { WalletButton, NetworkGuard, Card, Stat, TxButton, cleanErr } from "@/components/dapp";
+import { TradeChart } from "@/components/TradeChart";
 import { useWallet } from "@/lib/wallet";
 import { ADDRESSES, BPS, INDEX, type IndexKey, MAX_LEVERAGE, mockUsdcAbi, OPEN_FEE_BPS, perpAbi } from "@/lib/contracts";
 import { fmtPnl, fmtPrice, fmtUsdc, parseUsdc } from "@/lib/format";
@@ -195,10 +196,7 @@ function TradeInner() {
 
       {/* Positions + prices */}
       <div className="flex flex-col gap-4">
-        <div className="grid grid-cols-2 gap-4">
-          <PriceTile id="bvol" price={prices.bvol} nowSec={nowSec} />
-          <PriceTile id="evol" price={prices.evol} nowSec={nowSec} />
-        </div>
+        <TradeChart id={index} />
 
         <Card title="Your positions">
           {positions.length === 0 ? (
@@ -213,24 +211,6 @@ function TradeInner() {
         </Card>
       </div>
     </div>
-  );
-}
-
-function PriceTile({ id, price, nowSec }: { id: IndexKey; price: OraclePrice | null; nowSec: number }) {
-  const unset = !price || price.updatedAt === 0n;
-  const ageSec = price && price.updatedAt > 0n ? nowSec - Number(price.updatedAt) : null;
-  const stale = ageSec !== null && ageSec > STALE_SECS;
-  return (
-    <Card>
-      <div className="flex items-center justify-between">
-        <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted">{id.toUpperCase()}</span>
-        <span className={`h-1.5 w-1.5 rounded-full ${unset || stale ? "bg-soft-2" : "volx-pulse bg-up"}`} aria-hidden />
-      </div>
-      <div className="mt-2 font-mono text-2xl font-semibold tabular-nums">{price && !unset ? fmtPrice(price.value) : "—"}</div>
-      <div className="mt-1 text-[11px] text-soft">
-        {unset ? "no price yet" : stale ? "stale" : ageSec !== null ? `updated ${ageSec}s ago` : ""}
-      </div>
-    </Card>
   );
 }
 
