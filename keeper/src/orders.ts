@@ -53,16 +53,11 @@ export class PerpExecutor {
     const n = Number(next);
     if (n === 0) return 0;
 
-    const perp = { address: this.perp, abi: perpAbi } as const;
-    const rows = await this.pub.multicall({
-      allowFailure: false,
-      contracts: Array.from({ length: n }, (_, i) => ({ ...perp, functionName: "orders" as const, args: [BigInt(i)] })),
-    });
-
+    // Read orders one by one (no multicall — the client has no chain configured
+    // / Multicall3 address, and the order count is small).
     let executed = 0;
     for (let i = 0; i < n; i++) {
-      const o = rows[i];
-      if (!o) continue;
+      const o = await this.pub.readContract({ address: this.perp, abi: perpAbi, functionName: "orders", args: [BigInt(i)] });
       const trader = o[0] as Address;
       if (trader === ZERO) continue; // consumed / cancelled
 
