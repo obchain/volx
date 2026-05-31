@@ -9,6 +9,8 @@ export interface Config {
   rpcUrl: string;
   privateKey: `0x${string}`;
   oracleAddress: Address;
+  /** VolXPerpV2 — for the conditional-order executor. null disables it. */
+  perpAddress: Address | null;
   apiUrl: string;
   pollIntervalMs: number;
   deviationBps: number;
@@ -57,6 +59,23 @@ function resolveOracle(): Address {
   return parsed.oracle;
 }
 
+/** Resolve VolXPerpV2 for the order executor: PERP_ADDRESS, else `perp` in the
+ * v2 deploy artifact. Returns null (executor disabled) if neither is available. */
+function resolvePerp(): Address | null {
+  const explicit = process.env.PERP_ADDRESS?.trim();
+  if (explicit) {
+    if (!isAddress(explicit)) throw new Error(`PERP_ADDRESS is not a valid address: ${explicit}`);
+    return explicit;
+  }
+  const path = resolve(here, "..", process.env.PERP_DEPLOYMENTS_PATH ?? "../contracts/deployments/sepolia-v2.json");
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as { perp?: string };
+    return parsed.perp && isAddress(parsed.perp) ? parsed.perp : null;
+  } catch {
+    return null; // no v2 artifact -> executor disabled
+  }
+}
+
 export function loadConfig(): Config {
   const pk = req("PRIVATE_KEY");
   const privateKey = (pk.startsWith("0x") ? pk : `0x${pk}`) as `0x${string}`;
@@ -66,6 +85,7 @@ export function loadConfig(): Config {
     rpcUrl: req("SEPOLIA_RPC_URL"),
     privateKey,
     oracleAddress: resolveOracle(),
+    perpAddress: resolvePerp(),
     apiUrl: (process.env.VOLX_API_URL ?? "http://localhost:8090").replace(/\/$/, ""),
     pollIntervalMs: num("POLL_INTERVAL_MS", 60_000, 1_000),
     deviationBps: num("DEVIATION_BPS", 50, 1),

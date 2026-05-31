@@ -2,6 +2,7 @@ import { loadConfig } from "./config.js";
 import { fetchQuotes } from "./api.js";
 import { decide } from "./decide.js";
 import { OracleClient } from "./chain.js";
+import { PerpExecutor } from "./orders.js";
 import { log } from "./log.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -9,9 +10,16 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function main(): Promise<void> {
   const cfg = loadConfig();
   const oracle = new OracleClient(cfg.rpcUrl, cfg.privateKey, cfg.oracleAddress);
+  // Conditional-order executor (VolXPerpV2). Disabled if no perp configured.
+  const executor =
+    cfg.perpAddress && !cfg.dryRun
+      ? new PerpExecutor(cfg.rpcUrl, cfg.privateKey, cfg.perpAddress, cfg.oracleAddress)
+      : null;
 
   log.info("keeper starting", {
     oracle: cfg.oracleAddress,
+    perp: cfg.perpAddress,
+    orderExecutor: executor ? "on" : "off",
     signer: oracle.signer,
     apiUrl: cfg.apiUrl,
     deviationBps: cfg.deviationBps,
@@ -45,6 +53,15 @@ async function main(): Promise<void> {
       // tick already backs off internally on transient faults; this guards
       // anything unexpected so the loop never dies.
       log.error("tick failed", { err: (e as Error).message });
+    }
+    // After refreshing the price, sweep conditional orders (oracle is fresh).
+    if (executor) {
+      try {
+        const n = await executor.tick();
+        if (n > 0) log.info("order sweep", { executed: n });
+      } catch (e) {
+        log.error("order sweep failed", { err: (e as Error).message });
+      }
     }
     if (cfg.runOnce) break;
     await sleep(cfg.pollIntervalMs);
