@@ -92,3 +92,37 @@ export async function fetchHistory(
   if (!r.ok) throw new Error(`history ${id}: ${r.status}`);
   return (await r.json()) as HistoryResponse;
 }
+
+// REST GET /v1/health
+export interface HealthResponse {
+  status: string;
+  last_update_age_s: number;
+  version: string;
+}
+
+export async function fetchHealth(): Promise<HealthResponse> {
+  const r = await fetch(`/v1/health`, { cache: "no-store", headers: REST_HEADERS });
+  if (!r.ok) throw new Error(`health: ${r.status}`);
+  return (await r.json()) as HealthResponse;
+}
+
+// REST GET /v1/options/strip?index={id}
+// One expiry's strip: forward + the [strike, q_usd, iv] quote rows that feed
+// the variance integral. `near` is the front expiry; `next` the following one.
+export interface StripExpiry {
+  forward: number;
+  k_zero: number;
+  quotes: [number, number, number][]; // [strike, q_usd (option price), iv (decimal)]
+}
+
+export interface StripResponse {
+  index_id: string;
+  near?: StripExpiry;
+  next?: StripExpiry;
+}
+
+export async function fetchStrip(id: IndexId): Promise<StripResponse> {
+  const r = await fetch(`/v1/options/strip?index=${id}`, { cache: "no-store", headers: REST_HEADERS });
+  if (!r.ok) throw new Error(`strip ${id}: ${r.status}`);
+  return (await r.json()) as StripResponse;
+}
