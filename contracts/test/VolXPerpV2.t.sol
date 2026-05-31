@@ -45,7 +45,10 @@ contract VolXPerpV2Test is Test {
         oracle.updateOne(BVOL, v, CONF);
     }
 
-    function _open(address who, bool isLong, uint256 collateral, uint256 leverage) internal returns (uint256 id) {
+    function _open(address who, bool isLong, uint256 collateral, uint256 leverage)
+        internal
+        returns (uint256 id)
+    {
         vm.prank(who);
         id = perp.openPosition(BVOL, isLong, collateral, leverage);
     }
