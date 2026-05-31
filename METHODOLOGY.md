@@ -452,8 +452,9 @@ A tradeable layer exists on Ethereum Sepolia (a synthetic volatility perp; see
 methodology: the on-chain `VolXOracle` value is **authoritative from this
 off-chain engine** — there is no on-chain VIX math. An off-chain keeper pushes
 the engine's published index value (scaled to 1e8) on a deviation/heartbeat rule.
-The perp, vault, and oracle are a **testnet demo, not audited**, with no funding
-rate in v1. Nothing in this layer feeds back into the index computation.
+The perp, vault, and oracle are a **testnet demo, not audited**. Nothing in this
+layer (leverage, funding, liquidations, orders) feeds back into the index
+computation — the index is computed exactly as specified above, on- or off-chain.
 
 ---
 

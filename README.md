@@ -575,27 +575,48 @@ VolX is in active development.
 
 ---
 
-## On-chain perp (testnet demo)
+## On-chain perp (live on Sepolia testnet)
 
-Beyond publishing the index, VolX ships a **tradeable layer** on Ethereum
-Sepolia — the same move Volmex made with BVIV/EVIV perps, but open-source and
+Beyond publishing the index, VolX ships a full **tradeable layer** on Ethereum
+Sepolia — the same shape as Volmex's BVIV/EVIV perps, but open-source and
 self-hostable end to end. A gTrade-style synthetic perp lets traders take
 leveraged long/short positions on BVOL/EVOL; one shared LP vault is the
 counterparty, an off-chain keeper pushes the live index on-chain, and positions
 settle against the vault.
 
-- **MockUSDC** (6dp test collateral, faucet) · **VolXOracle** (keeper-pushed,
-  packed price + staleness guard) · **VolXPerp** (ERC4626-style LP vault +
-  leveraged positions + liquidation + fees).
-- 10× max leverage · 80% liquidation · 0.1% open/close fee · **no funding rate**
-  (v1) · loss capped at collateral, winning-long gain capped at notional, so the
-  vault is solvent against its reserve by construction.
-- A keeper (TS + viem) pushes on 0.5% deviation / 30m heartbeat; a Next.js
-  `/trade` + `/pool` UI makes it clickable.
+**Live app:** [volx-frontend-29824.netlify.app](https://volx-frontend-29824.netlify.app)
+— `/trade`, `/pool`, and an analytics `/dashboard`.
 
-A full vertical — keeper push → open long + short → price move → profitable close
-→ liquidation → LP fee yield — has been run live on Sepolia with verified
-contracts and recorded tx hashes.
+What it does:
+
+- **Trade** leveraged long/short on BVOL/EVOL (up to 10×), settled against the LP vault.
+- **Funding** — a continuous borrowing fee on open notional accrues to the vault
+  (the correct analog of perp funding for a single-vault counterparty model;
+  owner-tunable rate). Positions can be liquidated by funding alone.
+- **Conditional orders** — limit-open, take-profit, and stop-loss, **auto-executed
+  by the keeper** when the oracle price crosses the trigger.
+- **LP pool** — deposit mUSDC to be the counterparty; earn open/close fees + funding
+  + trader losses; bear trader wins. Loss capped at collateral, winning-long gain
+  capped at notional, so the vault stays solvent against its reserve by construction.
+- **Liquidations** at 80% collateral loss; permissionless, with a liquidator reward.
+- **Analytics dashboard** — live BVOL/EVOL, the implied-vol smile (strike → IV, the
+  raw variance-integral input), and on-chain protocol stats (TVL, open interest,
+  utilization, share price).
+- **Trading-terminal chart** — candles with your entry + liquidation lines and a live
+  liquidation preview as you size an order.
+
+Components:
+
+- **MockUSDC** (6dp test collateral, faucet) · **VolXOracle** (keeper-pushed packed
+  price + staleness guard) · **VolXPerpV2** (ERC4626-style LP vault + leveraged
+  positions + liquidation + fees + funding + conditional orders).
+- **Keeper** (TS + viem) — pushes the index on 0.5% deviation / 30m heartbeat and
+  sweeps + executes triggered orders.
+- **Frontend** — Next.js wallet app (`/trade` `/pool` `/dashboard`), deployed on Netlify.
+
+A full vertical — keeper push → open long + short → funding accrual →
+keeper-executed take-profit → close → liquidation → LP fee + funding yield — has
+been run live on Sepolia with verified contracts and recorded tx hashes.
 
 > **Testnet only, not audited, demo liquidity.** See
 > [`docs/onchain-demo.md`](./docs/onchain-demo.md) for addresses, run

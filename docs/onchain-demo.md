@@ -3,7 +3,9 @@
 > **Testnet demo. Not audited. No real value.** Ethereum Sepolia (chainId `11155111`).
 > This is the tradeable layer on top of the VolX index — a gTrade-style synthetic
 > volatility perp where one shared LP vault is the counterparty to every trade.
-> There is **no funding rate** in v1.
+
+**Live app:** [volx-frontend-29824.netlify.app](https://volx-frontend-29824.netlify.app)
+(`/trade` · `/pool` · `/dashboard`).
 
 ## What it is
 
@@ -12,14 +14,18 @@ This layer makes it **tradeable**: an off-chain keeper pushes the live index on-
 and traders open leveraged long/short bets that settle against an LP collateral vault.
 
 ```
-[VolX Go API] --keeper(deviation+heartbeat)--> [VolXOracle] <--reads-- [VolXPerp vault]
-   BVOL/EVOL live                               on-chain price        LP pot + positions
+[VolX Go API] --keeper(deviation+heartbeat)--> [VolXOracle] <--reads-- [VolXPerpV2 vault]
+   BVOL/EVOL live          + executes orders    on-chain price       LP pot + positions + orders
 ```
 
-- **Loss capped at collateral; a winning long's gain capped at notional** — so the vault
-  stays solvent against its reserved notional by construction.
-- **80%** liquidation threshold, **0.1%** open/close fee, **10×** max leverage, oracle
-  scale **1e8**, collateral **MockUSDC (6 decimals)**.
+- Leveraged long/short on BVOL/EVOL (up to **10×**), **80%** liquidation, **0.1%**
+  open/close fee, oracle scale **1e8**, collateral **MockUSDC (6dp)**.
+- **Funding** — a continuous borrowing fee on open notional accrues to the vault
+  (owner-tunable, default 0.3%/day); folds into equity, so funding alone can liquidate.
+- **Conditional orders** — limit-open, take-profit, stop-loss, executed by the keeper
+  when the oracle price crosses the trigger.
+- **Loss capped at collateral; winning-long gain capped at notional** — vault solvent
+  against its reserve by construction (funding only ever increases vault assets).
 
 ## Deployed contracts (verified on Etherscan)
 
@@ -27,11 +33,12 @@ and traders open leveraged long/short bets that settle against an LP collateral 
 |---|---|
 | MockUSDC | [`0x60137f8457Db371EE4092c5F6C8e389168C582F5`](https://sepolia.etherscan.io/address/0x60137f8457Db371EE4092c5F6C8e389168C582F5) |
 | VolXOracle | [`0x1762841A53F396B6C55eFbbB662D17A3B7Fa4947`](https://sepolia.etherscan.io/address/0x1762841A53F396B6C55eFbbB662D17A3B7Fa4947) |
-| VolXPerp (vault) | [`0x1BE8387f05d3556002683Fe0DE9131B15002b7fb`](https://sepolia.etherscan.io/address/0x1BE8387f05d3556002683Fe0DE9131B15002b7fb) |
+| **VolXPerpV2** (vault + funding + orders) | [`0xc2f0dD6fCaCC29BB90D24dCF16bf95bc7D08BCBB`](https://sepolia.etherscan.io/address/0xc2f0dD6fCaCC29BB90D24dCF16bf95bc7D08BCBB) |
 
-Canonical source of truth: [`contracts/deployments/sepolia.json`](../contracts/deployments/sepolia.json)
-(the keeper and frontend read it). The vault is seeded with 200,000 mUSDC of demo liquidity;
-the deployer is the oracle keeper.
+VolXPerpV2 reuses the existing MockUSDC + VolXOracle (only the perp is new). Addresses in
+[`contracts/deployments/sepolia-v2.json`](../contracts/deployments/sepolia-v2.json); the
+original v1 perp (`0x1BE8…b7fb`, no funding/orders) is superseded. The vault is seeded with
+200,000 mUSDC of demo liquidity.
 
 ## Run it
 
