@@ -19,6 +19,12 @@ export class OracleClient {
   private account;
   private oracle: Address;
   private chainReady: ReturnType<typeof defineChain> | null = null;
+  // Stuck-tx recovery state: when consecutive pushes resolve to the SAME
+  // nonce (the prior tx is still pending), we resend at that nonce with a
+  // strictly higher tip so the replacement is accepted instead of rejected
+  // as "replacement transaction underpriced".
+  private lastNonce: number | null = null;
+  private tip = 2_000_000_000n; // 2 gwei priority fee, escalates on retry
 
   constructor(rpcUrl: string, privateKey: Hex, oracle: Address) {
     this.account = privateKeyToAccount(privateKey);
@@ -65,9 +71,31 @@ export class OracleClient {
     return { bvol, evol };
   }
 
+  /** Compute EIP-1559 fees with generous headroom for volatile testnet gas,
+   * pinned to the first unconfirmed nonce so a stuck tx is *replaced* rather
+   * than queued behind itself. If the prior push is still pending (same nonce
+   * as last time), escalate the tip by +30% so the replacement clears the
+   * "underpriced" check. */
+  private async fees(): Promise<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; nonce: number }> {
+    const block = await this.pub.getBlock({ blockTag: "latest" });
+    const base = block.baseFeePerGas ?? 1_000_000_000n;
+    const nonce = await this.pub.getTransactionCount({ address: this.account.address, blockTag: "latest" });
+
+    if (nonce === this.lastNonce) {
+      this.tip = (this.tip * 13n) / 10n; // prior tx still stuck → bump tip 30%
+    } else {
+      this.tip = 2_000_000_000n; // nonce advanced (mined) → reset to baseline
+      this.lastNonce = nonce;
+    }
+
+    // 3x base covers a basefee spike between estimate and inclusion; +tip on top.
+    return { maxFeePerGas: base * 3n + this.tip, maxPriorityFeePerGas: this.tip, nonce };
+  }
+
   /** Push both indices in one tx and wait for the receipt. Returns the hash. */
   async pushBoth(bvol: IndexQuote, evol: IndexQuote): Promise<Hex> {
     const chain = await this.chain();
+    const { maxFeePerGas, maxPriorityFeePerGas, nonce } = await this.fees();
     const hash = await this.wallet.writeContract({
       account: this.account,
       chain,
@@ -77,10 +105,18 @@ export class OracleClient {
       // confScaled is a JS number but clamped to [0, 1e6] in api.ts, well within
       // uint32 — viem accepts number for small uint widths.
       args: [bvol.valueScaled, bvol.confScaled, evol.valueScaled, evol.confScaled],
+      // Explicit fees + nonce: testnet basefee is volatile and viem's default
+      // estimate runs too thin, leaving txs stuck. See fees().
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+      nonce,
     });
     // Bounded wait: a dropped/stuck tx would otherwise hang the loop forever.
-    // The timeout throws, propagates to the tick catch, and the loop continues.
+    // The timeout throws, propagates to the tick catch, and the loop continues;
+    // the next tick replaces this nonce with a higher tip via fees().
     await this.pub.waitForTransactionReceipt({ hash, timeout: 120_000 });
+    // Confirmed: clear the pending-nonce latch so fees() resets the tip.
+    this.lastNonce = null;
     return hash;
   }
 }
