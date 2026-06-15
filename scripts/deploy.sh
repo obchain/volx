@@ -12,7 +12,8 @@
 #
 # Env (from the `.env` beside the compose file, auto-loaded by compose):
 #   SEPOLIA_RPC_URL, PRIVATE_KEY   keeper signer (required)
-#   VOLX_REGISTRY (default ghcr.io/obchain), VOLX_TAG (default latest)
+#   VOLX_REGISTRY (default obchain219), VOLX_TAG (default latest)
+#   DOCKER_USERNAME, DOCKER_PASSWORD   only if the Docker Hub repos are private
 #   TUNNEL_TOKEN                   only with --tunnel
 
 set -euo pipefail
@@ -20,7 +21,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # Load the local .env so its values are visible to THIS script (compose reads
-# it on its own; we need GHCR_TOKEN/GHCR_USER here for the optional login).
+# it on its own; we need DOCKER_USERNAME/DOCKER_PASSWORD here for the login).
 if [ -f .env ]; then
   set -a; . ./.env; set +a
 fi
@@ -31,14 +32,14 @@ DC=(docker compose -f "$COMPOSE_FILE")
 PROFILE_ARGS=()
 [ "${1:-}" = "--tunnel" ] && PROFILE_ARGS=(--profile tunnel)
 
-# GHCR auth only needed for PRIVATE packages. Public packages pull anonymously;
-# set GHCR_TOKEN (a read:packages PAT) in .env if the images are private.
-if [ -n "${GHCR_TOKEN:-}" ]; then
-  echo "==> docker login ghcr.io as ${GHCR_USER:-obchain}"
-  echo "$GHCR_TOKEN" | docker login ghcr.io -u "${GHCR_USER:-obchain}" --password-stdin
+# Docker Hub auth only needed for PRIVATE repos. Public repos pull anonymously;
+# set DOCKER_USERNAME + DOCKER_PASSWORD (access token) in .env if private.
+if [ -n "${DOCKER_USERNAME:-}" ] && [ -n "${DOCKER_PASSWORD:-}" ]; then
+  echo "==> docker login as $DOCKER_USERNAME"
+  echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
 fi
 
-echo "==> pulling images (${VOLX_REGISTRY:-ghcr.io/obchain}, tag ${VOLX_TAG:-latest})"
+echo "==> pulling images (${VOLX_REGISTRY:-obchain219}, tag ${VOLX_TAG:-latest})"
 "${DC[@]}" "${PROFILE_ARGS[@]}" pull
 
 # `up -d` diffs each service's desired vs running state and recreates only the
