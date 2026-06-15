@@ -1,0 +1,56 @@
+name: deploy
+
+# Runs after the `ci` workflow succeeds on main (so a red build never deploys),
+# or on demand. The actual build happens on the server: this job only opens an
+# SSH session through the Cloudflare tunnel and runs scripts/deploy.sh, which
+# git-pulls and rebuilds only the services whose source changed.
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time; never cancel a deploy mid-flight (would risk a
+# half-rebuilt stack). Queued runs wait their turn.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Gate: only when the triggering CI run passed (manual dispatch has no
+    # workflow_run payload, so allow it through too).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install cloudflared
+        uses: AnimMouse/setup-cloudflared@v2
+
+      - name: Configure SSH over Cloudflare Access
+        env:
+          SSH_KEY_B64: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY_B64" | base64 --decode > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          cat > ~/.ssh/config <<'EOF'
+          Host ssh.ancilar.com
+            User ancilar
+            IdentityFile ~/.ssh/id_ed25519
+            ProxyCommand cloudflared access ssh --hostname %h
+            StrictHostKeyChecking no
+          EOF
+
+      - name: Deploy (build only changed services on the server)
+        run: |
+          ssh ssh.ancilar.com 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          cd ~/volx
+          ./scripts/deploy.sh
+          REMOTE
+
+      - name: Wipe SSH key
+        if: always()
+        run: shred -u ~/.ssh/id_ed25519 2>/dev/null || rm -f ~/.ssh/id_ed25519
