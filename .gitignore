@@ -50,3 +50,6 @@ research/data/
 
 # Local Netlify folder
 .netlify
+
+# selective-deploy state (server-local)
+.last-deployed
