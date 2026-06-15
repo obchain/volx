@@ -91,7 +91,7 @@ jobs:
           fi
           cat > ~/.ssh/config <<EOF
           Host ssh.ancilar.com
-            User ancilar
+            User lavesh
             IdentityFile ~/.ssh/id_ed25519
             ProxyCommand cloudflared access ssh --hostname %h
             StrictHostKeyChecking $CHECK
@@ -100,7 +100,7 @@ jobs:
 
       - name: Ship compose + deploy script, then pull & apply
         env:
-          DEPLOY_DIR: /home/ancilar/volx-deploy
+          DEPLOY_DIR: /home/lavesh/volx-deploy
           # Keeper runtime secrets — written into the server .env each deploy.
           # GitHub masks these values in the logs.
           SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
