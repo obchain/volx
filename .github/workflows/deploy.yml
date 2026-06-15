@@ -31,16 +31,28 @@ jobs:
       - name: Configure SSH over Cloudflare Access
         env:
           SSH_KEY_B64: ${{ secrets.SERVER_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.SERVER_KNOWN_HOSTS }}
         run: |
           mkdir -p ~/.ssh
           echo "$SSH_KEY_B64" | base64 --decode > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          cat > ~/.ssh/config <<'EOF'
+          # Pin the server host key when SERVER_KNOWN_HOSTS is provided (strict);
+          # otherwise fall back to accept-new (TOFU) — never blanket "no".
+          if [ -n "$KNOWN_HOSTS" ]; then
+            printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+            chmod 644 ~/.ssh/known_hosts
+            CHECK=yes
+          else
+            CHECK=accept-new
+            echo "::warning::SERVER_KNOWN_HOSTS not set — using accept-new (TOFU). Set it (ssh-keyscan output) to pin the host key."
+          fi
+          cat > ~/.ssh/config <<EOF
           Host ssh.ancilar.com
             User ancilar
             IdentityFile ~/.ssh/id_ed25519
             ProxyCommand cloudflared access ssh --hostname %h
-            StrictHostKeyChecking no
+            StrictHostKeyChecking $CHECK
+            UserKnownHostsFile ~/.ssh/known_hosts
           EOF
 
       - name: Deploy (build only changed services on the server)
