@@ -39,7 +39,11 @@ OLD_SHA=""
 echo "==> fetching latest"
 git fetch --quiet origin
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-git pull --quiet --ff-only origin "$BRANCH"
+if ! git pull --quiet --ff-only origin "$BRANCH"; then
+  echo "!!  git pull --ff-only failed: the server has local/diverging commits on" >&2
+  echo "!!  '$BRANCH'. Resolve manually (git status) then re-run. Nothing deployed." >&2
+  exit 1
+fi
 NEW_SHA="$(git rev-parse HEAD)"
 
 # First-ever deploy: no state to diff against -> bring up the whole stack.
@@ -79,12 +83,13 @@ if match '^docker/clickhouse-init\.sql$'; then
   echo "!!  ('docker compose -f $COMPOSE_FILE down -v') DESTROYS all data."
 fi
 
-# Build the set of services to rebuild.
+# Build the set of services to rebuild. Use explicit `if` blocks rather than
+# `match ... && SVC[x]=1` so a non-matching `match` can never trip `set -e`.
 declare -A SVC
-match '^api/'              && SVC[api]=1
-match '^keeper/'           && SVC[keeper]=1
-match '^crates/engine/'    && SVC[engine]=1
-match '^crates/ingestion/' && SVC[ingestion]=1
+if match '^api/';              then SVC[api]=1;       fi
+if match '^keeper/';           then SVC[keeper]=1;    fi
+if match '^crates/engine/';    then SVC[engine]=1;    fi
+if match '^crates/ingestion/'; then SVC[ingestion]=1; fi
 
 # Shared Rust crates + the workspace manifest/lockfile affect BOTH binaries.
 if match '^crates/normalizer/|^crates/shared-types/|^Cargo\.(toml|lock)$'; then
