@@ -25,7 +25,7 @@
 # Config — a `.env` beside this file (gitignored) or exported shell env:
 #   SEPOLIA_RPC_URL, PRIVATE_KEY   keeper signer (required)
 #   TUNNEL_TOKEN                   only with --profile tunnel
-#   VOLX_REGISTRY (default ghcr.io/obchain), VOLX_TAG (default latest)
+#   VOLX_REGISTRY (default obchain219), VOLX_TAG (default latest)
 
 name: volx-prod
 
@@ -79,7 +79,7 @@ services:
   ingestion:
     # Pre-built image pulled from the registry on the server. `build:` is kept
     # for local `up --build`; on the server we only `pull` so the image wins.
-    image: ${VOLX_REGISTRY:-ghcr.io/obchain}/volx-ingestion:${VOLX_TAG:-latest}
+    image: ${VOLX_REGISTRY:-obchain219}/volx-ingestion:${VOLX_TAG:-latest}
     build:
       context: ..
       dockerfile: crates/ingestion/Dockerfile
@@ -100,7 +100,7 @@ services:
       disable: true
 
   engine:
-    image: ${VOLX_REGISTRY:-ghcr.io/obchain}/volx-engine:${VOLX_TAG:-latest}
+    image: ${VOLX_REGISTRY:-obchain219}/volx-engine:${VOLX_TAG:-latest}
     build:
       context: ..
       dockerfile: crates/engine/Dockerfile
@@ -124,7 +124,7 @@ services:
       disable: true
 
   api:
-    image: ${VOLX_REGISTRY:-ghcr.io/obchain}/volx-api:${VOLX_TAG:-latest}
+    image: ${VOLX_REGISTRY:-obchain219}/volx-api:${VOLX_TAG:-latest}
     build:
       context: ..
       dockerfile: api/Dockerfile
@@ -151,7 +151,7 @@ services:
       disable: true
 
   keeper:
-    image: ${VOLX_REGISTRY:-ghcr.io/obchain}/volx-keeper:${VOLX_TAG:-latest}
+    image: ${VOLX_REGISTRY:-obchain219}/volx-keeper:${VOLX_TAG:-latest}
     build:
       context: ..
       dockerfile: keeper/Dockerfile
