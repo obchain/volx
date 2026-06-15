@@ -1,0 +1,181 @@
+# Production compose for VolX — single always-on host (24/7 Ubuntu server).
+#
+# Differences from the dev compose (docker-compose.yml):
+#  - Data services (ClickHouse, Redis) and the Rust metrics ports are NOT
+#    published to the host: on a public server only the tunnel should reach
+#    in. Everything talks over the private compose network instead.
+#  - Adds the `keeper` service (oracle pusher + order executor) so the whole
+#    backend lives in one `docker compose up -d`.
+#  - Adds an optional `cloudflared` service (profile: tunnel) that exposes the
+#    API over a stable Cloudflare named tunnel — no host install, no domain DNS
+#    juggling beyond the one-time dashboard hostname mapping.
+#  - The API IS published, but only on 127.0.0.1:8090, so a host-installed
+#    cloudflared / local curl still works while staying off the public IP.
+#
+# Bring up:                  docker compose -f docker-compose.prod.yml up -d --build
+# With containerized tunnel: docker compose -f docker-compose.prod.yml --profile tunnel up -d --build
+#
+# Secrets (gitignored, create on the server):
+#   ../.secrets/sepolia.env     SEPOLIA_RPC_URL + PRIVATE_KEY (keeper signer)
+#   ../.secrets/cloudflared.env TUNNEL_TOKEN  (only if using the tunnel profile)
+
+name: volx-prod
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    container_name: volx-clickhouse
+    restart: unless-stopped
+    # No host ports in prod — reachable only as `clickhouse:8123/9000` on the
+    # compose network. Keeps the DB off the server's public interface.
+    environment:
+      CLICKHOUSE_DB: volx
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse-init.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: volx-redis
+    restart: unless-stopped
+    command:
+      - "redis-server"
+      - "--appendonly"
+      - "yes"
+      - "--maxmemory"
+      - "256mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  ingestion:
+    build:
+      context: ..
+      dockerfile: crates/ingestion/Dockerfile
+    container_name: volx-ingestion
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_URL: "http://clickhouse:8123"
+      CLICKHOUSE_DB: "volx"
+      REDIS_URL: "redis://redis:6379"
+      METRICS_BIND: "0.0.0.0:9100"
+      RUST_LOG: "info,volx_ingestion=info,volx_normalizer=info"
+    healthcheck:
+      disable: true
+
+  engine:
+    build:
+      context: ..
+      dockerfile: crates/engine/Dockerfile
+    container_name: volx-engine
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ingestion:
+        condition: service_started
+    environment:
+      CLICKHOUSE_URL: "http://clickhouse:8123"
+      CLICKHOUSE_DB: "volx"
+      REDIS_URL: "redis://redis:6379"
+      METRICS_BIND: "0.0.0.0:9101"
+      ENGINE_VENUES_EXPECTED: "3"
+      RUST_LOG: "info,volx_engine=info"
+    healthcheck:
+      disable: true
+
+  api:
+    build:
+      context: ..
+      dockerfile: api/Dockerfile
+    container_name: volx-api
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_DSN: "clickhouse://default@clickhouse:9000?dial_timeout=2s"
+      CLICKHOUSE_DB: "volx"
+      REDIS_URL: "redis://redis:6379"
+      API_BIND: "0.0.0.0:8080"
+      # Production WS rate limit (PRD §6): cap connections per IP.
+      WS_MAX_CONNS_PER_IP: "5"
+    ports:
+      # Loopback-only on the host. The tunnel reaches the API as `api:8080`
+      # over the compose network; this mapping is for local curl / a
+      # host-installed cloudflared.
+      - "127.0.0.1:${VOLX_API_HOST_PORT:-8090}:8080"
+    healthcheck:
+      disable: true
+
+  keeper:
+    build:
+      context: ..
+      dockerfile: keeper/Dockerfile
+    container_name: volx-keeper
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    env_file:
+      # SEPOLIA_RPC_URL + PRIVATE_KEY — create on the server, gitignored.
+      - ../.secrets/sepolia.env
+    environment:
+      # Reach the API over the compose network (not the host port).
+      VOLX_API_URL: "http://api:8080"
+      # Contract addresses injected directly so the image needs no
+      # contracts/deployments artifact. Override here on redeploy.
+      ORACLE_ADDRESS: "0x1762841A53F396B6C55eFbbB662D17A3B7Fa4947"
+      PERP_ADDRESS: "0xc2f0dD6fCaCC29BB90D24dCF16bf95bc7D08BCBB"
+      POLL_INTERVAL_MS: "60000"
+      DEVIATION_BPS: "50"
+      HEARTBEAT_MS: "1800000"
+
+  # Optional containerized Cloudflare tunnel (token-based connector).
+  # Enable with: --profile tunnel. Create the tunnel + public hostname in the
+  # Cloudflare Zero Trust dashboard, map the hostname to http://api:8080, and
+  # put the connector token in ../.secrets/cloudflared.env as TUNNEL_TOKEN.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: volx-cloudflared
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    command: ["tunnel", "--no-autoupdate", "run"]
+    env_file:
+      - ../.secrets/cloudflared.env
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  clickhouse-data:
+  redis-data:
