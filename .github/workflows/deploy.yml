@@ -105,6 +105,9 @@ jobs:
           # GitHub masks these values in the logs.
           SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
           PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          # Pin the server's registry to whatever CI pushed to, so the compose
+          # default can never drift from the images that were just built.
+          VOLX_REGISTRY: ${{ secrets.DOCKER_USERNAME }}
         run: |
           ssh ssh.ancilar.com "mkdir -p $DEPLOY_DIR"
           scp docker/docker-compose.prod.yml ssh.ancilar.com:"$DEPLOY_DIR/docker-compose.prod.yml"
@@ -112,9 +115,11 @@ jobs:
           scp scripts/deploy.sh              ssh.ancilar.com:"$DEPLOY_DIR/deploy.sh"
           # Write the runtime .env on the server from the GitHub secrets (umask
           # 077 -> 0600). docker compose auto-loads it; the keeper reads the keys.
+          # Docker Hub repos must be PUBLIC (no server-side login is configured).
           ssh ssh.ancilar.com "umask 077; cat > $DEPLOY_DIR/.env" <<EOF
           SEPOLIA_RPC_URL=$SEPOLIA_RPC_URL
           PRIVATE_KEY=$PRIVATE_KEY
+          VOLX_REGISTRY=$VOLX_REGISTRY
           EOF
           ssh ssh.ancilar.com "cd $DEPLOY_DIR && chmod +x deploy.sh && VOLX_TAG=latest ./deploy.sh"
 
