@@ -68,33 +68,9 @@ jobs:
       - run: go test ./...
       - run: go build -o /tmp/api-bin ./cmd/api
 
-  # ---------------------------------------------------------------------------
-  # Frontend: lint + typecheck + build.
-  # ---------------------------------------------------------------------------
-  frontend:
-    name: frontend (lint + typecheck + build)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: frontend
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: "9.15.0"
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
-
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm lint
-      - run: pnpm typecheck
-      - run: pnpm build
+  # Frontend has no CI job here: it is deployed + built by Netlify on its own
+  # pipeline, which fails the deploy on a bad lint/typecheck/build. Duplicating
+  # it here added minutes without gating anything this repo controls.
 
   keeper:
     name: keeper (typecheck + test)
@@ -134,7 +110,7 @@ jobs:
     name: e2e (local pipeline smoke)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    needs: [rust, go, frontend]
+    needs: [rust, go]
     steps:
       - uses: actions/checkout@v4
 
