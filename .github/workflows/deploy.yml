@@ -1,9 +1,8 @@
 name: deploy
 
 # Runs after the `ci` workflow succeeds on main (so a red build never deploys),
-# or on demand. The actual build happens on the server: this job only opens an
-# SSH session through the Cloudflare tunnel and runs scripts/deploy.sh, which
-# git-pulls and rebuilds only the services whose source changed.
+# or on demand. Builds the four backend images, pushes them to GHCR, then ships
+# the compose + deploy script to the server and pulls the new images there.
 on:
   workflow_run:
     workflows: ["ci"]
@@ -11,20 +10,61 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# One deploy at a time; never cancel a deploy mid-flight (would risk a
-# half-rebuilt stack). Queued runs wait their turn.
+# One deploy at a time; never cancel mid-flight (would risk a half-applied
+# stack). Queued runs wait their turn.
 concurrency:
   group: deploy-prod
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  packages: write   # push images to ghcr.io/<owner>/volx-*
+
 jobs:
-  deploy:
-    # Gate: only when the triggering CI run passed (manual dispatch has no
-    # workflow_run payload, so allow it through too).
+  build:
+    # Only on a successful CI run, or manual dispatch (no workflow_run payload).
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { svc: api,       dockerfile: api/Dockerfile }
+          - { svc: engine,    dockerfile: crates/engine/Dockerfile }
+          - { svc: ingestion, dockerfile: crates/ingestion/Dockerfile }
+          - { svc: keeper,    dockerfile: keeper/Dockerfile }
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push ${{ matrix.svc }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/volx-${{ matrix.svc }}:latest
+            ghcr.io/${{ github.repository_owner }}/volx-${{ matrix.svc }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.svc }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.svc }}
+
+  deploy:
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Install cloudflared
         uses: AnimMouse/setup-cloudflared@v2
 
@@ -55,13 +95,18 @@ jobs:
             UserKnownHostsFile ~/.ssh/known_hosts
           EOF
 
-      - name: Deploy (build only changed services on the server)
+      - name: Ship compose + deploy script, then pull & apply
+        env:
+          DEPLOY_DIR: /home/ancilar/volx-deploy
         run: |
-          ssh ssh.ancilar.com 'bash -se' <<'REMOTE'
-          set -euo pipefail
-          cd ~/volx
-          ./scripts/deploy.sh
-          REMOTE
+          ssh ssh.ancilar.com "mkdir -p $DEPLOY_DIR"
+          scp docker/docker-compose.prod.yml ssh.ancilar.com:"$DEPLOY_DIR/docker-compose.prod.yml"
+          scp docker/clickhouse-init.sql     ssh.ancilar.com:"$DEPLOY_DIR/clickhouse-init.sql"
+          scp scripts/deploy.sh              ssh.ancilar.com:"$DEPLOY_DIR/deploy.sh"
+          # The server already holds $DEPLOY_DIR/.env (keeper secrets), placed
+          # once by hand. deploy.sh pulls the freshly-pushed images and recreates
+          # only the services whose digest changed.
+          ssh ssh.ancilar.com "cd $DEPLOY_DIR && chmod +x deploy.sh && VOLX_TAG=latest ./deploy.sh"
 
       - name: Wipe SSH key
         if: always()
