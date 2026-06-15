@@ -12,12 +12,20 @@
 #  - The API IS published, but only on 127.0.0.1:8090, so a host-installed
 #    cloudflared / local curl still works while staying off the public IP.
 #
-# Bring up:                  docker compose -f docker-compose.prod.yml up -d --build
-# With containerized tunnel: docker compose -f docker-compose.prod.yml --profile tunnel up -d --build
+# The four app services carry both `image:` (registry, pulled on the server)
+# and `build:` (local). On the server we only `pull` + `up -d`, so the
+# pre-built image is used and no source checkout is needed. Locally,
+# `up -d --build` rebuilds from source as before.
 #
-# Secrets (gitignored, create on the server):
-#   ../.secrets/sepolia.env     SEPOLIA_RPC_URL + PRIVATE_KEY (keeper signer)
-#   ../.secrets/cloudflared.env TUNNEL_TOKEN  (only if using the tunnel profile)
+# Server deploy:   docker compose -f docker-compose.prod.yml pull && up -d
+# With tunnel:     ... --profile tunnel up -d
+# Local (build):   set -a; . ../.secrets/sepolia.env; set +a; \
+#                  docker compose -f docker-compose.prod.yml up -d --build
+#
+# Config — a `.env` beside this file (gitignored) or exported shell env:
+#   SEPOLIA_RPC_URL, PRIVATE_KEY   keeper signer (required)
+#   TUNNEL_TOKEN                   only with --profile tunnel
+#   VOLX_REGISTRY (default ghcr.io/obchain), VOLX_TAG (default latest)
 
 name: volx-prod
 
@@ -69,6 +77,9 @@ services:
       start_period: 5s
 
   ingestion:
+    # Pre-built image pulled from the registry on the server. `build:` is kept
+    # for local `up --build`; on the server we only `pull` so the image wins.
+    image: ${VOLX_REGISTRY:-ghcr.io/obchain}/volx-ingestion:${VOLX_TAG:-latest}
     build:
       context: ..
       dockerfile: crates/ingestion/Dockerfile
@@ -89,6 +100,7 @@ services:
       disable: true
 
   engine:
+    image: ${VOLX_REGISTRY:-ghcr.io/obchain}/volx-engine:${VOLX_TAG:-latest}
     build:
       context: ..
       dockerfile: crates/engine/Dockerfile
@@ -112,6 +124,7 @@ services:
       disable: true
 
   api:
+    image: ${VOLX_REGISTRY:-ghcr.io/obchain}/volx-api:${VOLX_TAG:-latest}
     build:
       context: ..
       dockerfile: api/Dockerfile
@@ -138,6 +151,7 @@ services:
       disable: true
 
   keeper:
+    image: ${VOLX_REGISTRY:-ghcr.io/obchain}/volx-keeper:${VOLX_TAG:-latest}
     build:
       context: ..
       dockerfile: keeper/Dockerfile
@@ -146,10 +160,12 @@ services:
     depends_on:
       api:
         condition: service_started
-    env_file:
-      # SEPOLIA_RPC_URL + PRIVATE_KEY — create on the server, gitignored.
-      - ../.secrets/sepolia.env
     environment:
+      # Keeper signer secrets come from the compose-dir `.env` (server) or the
+      # exported shell env (local: `set -a; . ../.secrets/sepolia.env`). Marked
+      # required so a missing value fails fast instead of starting unsigned.
+      SEPOLIA_RPC_URL: "${SEPOLIA_RPC_URL:?set SEPOLIA_RPC_URL in .env}"
+      PRIVATE_KEY: "${PRIVATE_KEY:?set PRIVATE_KEY in .env}"
       # Reach the API over the compose network (not the host port).
       VOLX_API_URL: "http://api:8080"
       # Contract addresses injected directly so the image needs no
@@ -163,15 +179,15 @@ services:
   # Optional containerized Cloudflare tunnel (token-based connector).
   # Enable with: --profile tunnel. Create the tunnel + public hostname in the
   # Cloudflare Zero Trust dashboard, map the hostname to http://api:8080, and
-  # put the connector token in ../.secrets/cloudflared.env as TUNNEL_TOKEN.
+  # provide TUNNEL_TOKEN via the compose-dir `.env`.
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: volx-cloudflared
     restart: unless-stopped
     profiles: ["tunnel"]
     command: ["tunnel", "--no-autoupdate", "run"]
-    env_file:
-      - ../.secrets/cloudflared.env
+    environment:
+      TUNNEL_TOKEN: "${TUNNEL_TOKEN:-}"
     depends_on:
       api:
         condition: service_started
