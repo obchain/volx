@@ -16,16 +16,16 @@ concurrency:
   group: deploy-prod
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  packages: write   # push images to ghcr.io/<owner>/volx-*
-
 jobs:
   build:
     # Only on a successful CI run, or manual dispatch (no workflow_run payload).
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Only the build job pushes images; deploy needs nothing beyond read.
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +62,8 @@ jobs:
     needs: [build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
