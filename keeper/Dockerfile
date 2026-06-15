@@ -16,7 +16,10 @@ WORKDIR /app
 # Pin pnpm to match keeper's CI (10.6.0 honours `onlyBuiltDependencies`).
 RUN corepack enable && corepack prepare pnpm@10.6.0 --activate
 
-# Dep layer: lockfile-only copy → install cached until deps change.
+# Dep layer: manifest + lockfile copy → install cached until deps change.
+# pnpm-workspace.yaml carries the `onlyBuiltDependencies` gate (esbuild's
+# postinstall, also mirrored in package.json) — keep it so the build matches CI.
+# No --prod: tsx/typescript are devDependencies needed at runtime.
 COPY keeper/package.json keeper/pnpm-lock.yaml keeper/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 

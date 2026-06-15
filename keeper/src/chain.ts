@@ -82,7 +82,11 @@ export class OracleClient {
     const nonce = await this.pub.getTransactionCount({ address: this.account.address, blockTag: "latest" });
 
     if (nonce === this.lastNonce) {
-      this.tip = (this.tip * 13n) / 10n; // prior tx still stuck → bump tip 30%
+      // Prior tx still stuck → bump tip 30%, capped at 50 gwei so a tx wedged
+      // across many ticks can't escalate the fee unboundedly into RPC-reject
+      // territory (which would permanently jam the keeper).
+      this.tip = (this.tip * 13n) / 10n;
+      if (this.tip > 50_000_000_000n) this.tip = 50_000_000_000n;
     } else {
       this.tip = 2_000_000_000n; // nonce advanced (mined) → reset to baseline
       this.lastNonce = nonce;
