@@ -72,6 +72,11 @@ export class PerpExecutor {
 
       try {
         const chain = await this.chain();
+        // Generous EIP-1559 fees: thin default estimates leave testnet txs
+        // stuck (see chain.ts fees()). 3x base + 2 gwei tip covers spikes.
+        const block = await this.pub.getBlock({ blockTag: "latest" });
+        const base = block.baseFeePerGas ?? 1_000_000_000n;
+        const tip = 2_000_000_000n;
         const hash = await this.wallet.writeContract({
           account: this.account,
           chain,
@@ -79,6 +84,8 @@ export class PerpExecutor {
           abi: perpAbi,
           functionName: "executeOrder",
           args: [BigInt(i)],
+          maxFeePerGas: base * 3n + tip,
+          maxPriorityFeePerGas: tip,
         });
         await this.pub.waitForTransactionReceipt({ hash, timeout: 120_000 });
         executed++;
