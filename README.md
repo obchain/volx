@@ -515,13 +515,14 @@ curl https://volx-api.ancilar.com/v1/index/bvol/latest
 wss://volx-api.ancilar.com/v1/stream
 ```
 
-Subscribe to one or more indices; receive `IndexValue` rows pushed on
-every 60-second publish.
+Subscribe to one or more channels (lower-case index ids); receive a `tick`
+frame per channel on every 60-second publish. `ts` is Unix epoch
+milliseconds.
 
 ```json
-> {"action":"subscribe","channels":["BVOL","EVOL"]}
-< {"type":"index","data":{"index_id":"BVOL","value":65.42,"ts":"..."}}
-< {"type":"index","data":{"index_id":"EVOL","value":71.10,"ts":"..."}}
+> {"action":"subscribe","channels":["bvol","evol"]}
+< {"type":"tick","channel":"bvol","value":39.15,"ts":1718634459188,"confidence":0.19}
+< {"type":"tick","channel":"evol","value":58.57,"ts":1718634459188,"confidence":0.19}
 ```
 
 Rate limit: 60 req/min REST, 1 concurrent WS. Auth-keyed higher-tier
