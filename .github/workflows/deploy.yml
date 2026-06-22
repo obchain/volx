@@ -75,6 +75,10 @@ jobs:
         env:
           SSH_KEY_B64: ${{ secrets.SERVER_SSH_KEY }}
           KNOWN_HOSTS: ${{ secrets.SERVER_KNOWN_HOSTS }}
+          # Server identity (host alias + login user) come from secrets so the
+          # deploy target is not hard-coded in the public workflow.
+          SERVER_SSH_HOST: ${{ secrets.SERVER_SSH_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
         run: |
           mkdir -p ~/.ssh
           echo "$SSH_KEY_B64" | base64 --decode > ~/.ssh/id_ed25519
@@ -90,8 +94,8 @@ jobs:
             echo "::warning::SERVER_KNOWN_HOSTS not set — using accept-new (TOFU). Set it (ssh-keyscan output) to pin the host key."
           fi
           cat > ~/.ssh/config <<EOF
-          Host ssh.ancilar.com
-            User lavesh
+          Host $SERVER_SSH_HOST
+            User $SERVER_USER
             IdentityFile ~/.ssh/id_ed25519
             ProxyCommand cloudflared access ssh --hostname %h
             StrictHostKeyChecking $CHECK
@@ -100,7 +104,10 @@ jobs:
 
       - name: Ship compose + deploy script, then pull & apply
         env:
-          DEPLOY_DIR: /home/lavesh/volx-deploy
+          # Deploy target (host alias + dir) from secrets — keep the server
+          # identity out of the public workflow.
+          SERVER_SSH_HOST: ${{ secrets.SERVER_SSH_HOST }}
+          DEPLOY_DIR: ${{ secrets.SERVER_DEPLOY_DIR }}
           # Keeper runtime secrets — written into the server .env each deploy.
           # GitHub masks these values in the logs.
           SEPOLIA_RPC_URL: ${{ secrets.SEPOLIA_RPC_URL }}
@@ -109,19 +116,19 @@ jobs:
           # default can never drift from the images that were just built.
           VOLX_REGISTRY: ${{ secrets.DOCKER_USERNAME }}
         run: |
-          ssh ssh.ancilar.com "mkdir -p $DEPLOY_DIR"
-          scp docker/docker-compose.prod.yml ssh.ancilar.com:"$DEPLOY_DIR/docker-compose.prod.yml"
-          scp docker/clickhouse-init.sql     ssh.ancilar.com:"$DEPLOY_DIR/clickhouse-init.sql"
-          scp scripts/deploy.sh              ssh.ancilar.com:"$DEPLOY_DIR/deploy.sh"
+          ssh "$SERVER_SSH_HOST" "mkdir -p $DEPLOY_DIR"
+          scp docker/docker-compose.prod.yml "$SERVER_SSH_HOST:$DEPLOY_DIR/docker-compose.prod.yml"
+          scp docker/clickhouse-init.sql     "$SERVER_SSH_HOST:$DEPLOY_DIR/clickhouse-init.sql"
+          scp scripts/deploy.sh              "$SERVER_SSH_HOST:$DEPLOY_DIR/deploy.sh"
           # Write the runtime .env on the server from the GitHub secrets (umask
           # 077 -> 0600). docker compose auto-loads it; the keeper reads the keys.
           # Docker Hub repos must be PUBLIC (no server-side login is configured).
-          ssh ssh.ancilar.com "umask 077; cat > $DEPLOY_DIR/.env" <<EOF
+          ssh "$SERVER_SSH_HOST" "umask 077; cat > $DEPLOY_DIR/.env" <<EOF
           SEPOLIA_RPC_URL=$SEPOLIA_RPC_URL
           PRIVATE_KEY=$PRIVATE_KEY
           VOLX_REGISTRY=$VOLX_REGISTRY
           EOF
-          ssh ssh.ancilar.com "cd $DEPLOY_DIR && chmod +x deploy.sh && VOLX_TAG=latest ./deploy.sh"
+          ssh "$SERVER_SSH_HOST" "cd $DEPLOY_DIR && chmod +x deploy.sh && VOLX_TAG=latest ./deploy.sh"
 
       - name: Wipe SSH key
         if: always()
