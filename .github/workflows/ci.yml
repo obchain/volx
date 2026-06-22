@@ -3,6 +3,13 @@ name: ci
 on:
   push:
     branches: [main]
+    # Docs-only changes don't affect the build/tests — skip CI (and therefore
+    # the deploy that runs on CI success) so a README edit never rebuilds
+    # images or redeploys the server.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
   pull_request:
 
 # A new push to the same branch supersedes the prior run.
