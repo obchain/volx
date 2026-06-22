@@ -158,9 +158,11 @@ Key properties:
 
 Idempotent pull-and-apply. In order, it:
 
-1. Sources the local `.env` (so `DOCKER_USERNAME/PASSWORD` are available for
-   an optional `docker login` — only needed if the Docker Hub repos are
-   private; public repos pull anonymously).
+1. Sources the local `.env`. The Docker Hub repos are **public**, so the
+   pull is anonymous and no `docker login` happens in the normal flow. The
+   login step runs **only** if a `DOCKER_USERNAME` + `DOCKER_PASSWORD` pair
+   is present in the `.env` (for a private registry) — CI does **not** write
+   those into the server `.env`.
 2. `docker compose pull` — fetches the images for the configured
    `VOLX_REGISTRY` / `VOLX_TAG`.
 3. `docker compose up -d --remove-orphans` — diffs desired vs running state
@@ -173,26 +175,41 @@ Idempotent pull-and-apply. In order, it:
 
 ## Configuration & secrets
 
-Runtime config lives in a **`.env` beside the compose file** on the server
-(gitignored; written by CI from GitHub secrets, mode `0600`). Compose
-auto-loads it.
+There are two distinct secret stores — they overlap but are **not** the
+same set.
 
-| Variable | Used by | Notes |
+### Server `.env`
+
+Lives beside the compose file on the server (gitignored; mode `0600`).
+Compose auto-loads it. CI writes exactly three keys into it each deploy
+(`SEPOLIA_RPC_URL`, `PRIVATE_KEY`, `VOLX_REGISTRY`); the rest are optional
+and only set by hand.
+
+| Variable | Used by | Written by CI? | Notes |
+| --- | --- | --- | --- |
+| `SEPOLIA_RPC_URL` | keeper | yes | Sepolia JSON-RPC endpoint (required) |
+| `PRIVATE_KEY` | keeper | yes | oracle/order signer key — **testnet only** (required) |
+| `VOLX_REGISTRY` | compose | yes | Docker Hub namespace (default in compose) |
+| `VOLX_TAG` | compose | no (passed inline by deploy: `VOLX_TAG=latest`) | deployed image tag (default `latest`) |
+| `DOCKER_USERNAME` / `DOCKER_PASSWORD` | deploy.sh | no | only if the registry repos are private (they are public, so normally unset) |
+| `TUNNEL_TOKEN` | cloudflared | no | only with `--profile tunnel` |
+
+The keeper's contract addresses (`ORACLE_ADDRESS`, `PERP_ADDRESS`) and its
+timing constants are baked into the compose file (see below), so the image
+needs no deployment artifact; override them there on a redeploy.
+
+### GitHub Actions secrets
+
+Used by the workflows — the **build** job pushes to the registry, the
+**deploy** job SSHes in and writes the server `.env`:
+
+| Secret | Used by | Purpose |
 | --- | --- | --- |
-| `SEPOLIA_RPC_URL` | keeper | Sepolia JSON-RPC endpoint (required) |
-| `PRIVATE_KEY` | keeper | oracle/order signer key — **testnet only** (required) |
-| `VOLX_REGISTRY` | compose | Docker Hub namespace (default in compose) |
-| `VOLX_TAG` | compose | deployed image tag (default `latest`) |
-| `DOCKER_USERNAME` / `DOCKER_PASSWORD` | deploy.sh | only if registry repos are private |
-| `TUNNEL_TOKEN` | cloudflared | only with `--profile tunnel` |
-
-The keeper's contract addresses (`ORACLE_ADDRESS`, `PERP_ADDRESS`) are baked
-into the compose file so the image needs no deployment artifact; override
-them there on a redeploy.
-
-**GitHub Actions secrets** mirror what the server needs, plus the SSH path:
-`DOCKER_USERNAME`, `DOCKER_PASSWORD`, `SERVER_SSH_KEY` (+ optional
-`SERVER_KNOWN_HOSTS`), `SEPOLIA_RPC_URL`, `PRIVATE_KEY`.
+| `DOCKER_USERNAME` / `DOCKER_PASSWORD` | build job | push images to Docker Hub (registry auth) — **not** sent to the server |
+| `SERVER_SSH_KEY` | deploy job | SSH key to reach the server over Cloudflare Access |
+| `SERVER_KNOWN_HOSTS` | deploy job | optional — pin the host key (else accept-new) |
+| `SEPOLIA_RPC_URL` | deploy job | written into the server `.env` |
+| `PRIVATE_KEY` | deploy job | written into the server `.env` |
 
 > Rotating the RPC or signer key means updating **both** the GitHub secret
 > (so the next deploy doesn't overwrite it) **and** the server `.env`, then
@@ -204,9 +221,12 @@ them there on a redeploy.
 
 The keeper is the bridge between the off-chain index and the on-chain perp:
 
-- Polls the VolX API and **pushes BVOL/EVOL to `VolXOracle`** on Sepolia on
-  a price-deviation trigger (`DEVIATION_BPS=50`, i.e. 0.5 %) or a heartbeat
-  (`HEARTBEAT_MS=1800000`, 30 min), whichever comes first.
+- Polls the VolX API every `POLL_INTERVAL_MS=60000` (60 s) and **pushes
+  BVOL/EVOL to `VolXOracle`** on Sepolia on a price-deviation trigger
+  (`DEVIATION_BPS=50`, i.e. 0.5 %) or a heartbeat (`HEARTBEAT_MS=1800000`,
+  30 min), whichever comes first. These three constants are hardcoded in the
+  compose `keeper` service (not `.env`-overridable) — edit the compose file
+  to change them.
 - Sweeps open conditional orders and **executes** limit/TP/SL when the
   oracle price crosses the trigger.
 - Talks to the API over the private compose network (`http://api:8080`), and
