@@ -526,7 +526,7 @@ milliseconds.
 ```
 
 Rate limit: 60 req/min REST, 1 concurrent WS. Auth-keyed higher-tier
-limits land in M2.
+limits are future work (not yet scoped).
 
 ---
 
@@ -542,7 +542,7 @@ limits land in M2.
 | Published VIX (CBOE benchmark) | CBOE daily close CSV | $0 | daily |
 | Risk-free rate `r` | constant 0 (matches DVOL; see METHODOLOGY §4.4) | n/a | n/a |
 
-No paid feeds in v1. Multi-venue live in M2.
+No paid feeds in v1. Multi-venue (Deribit + OKX + Bybit) is live.
 
 ---
 
@@ -555,8 +555,8 @@ No paid feeds in v1. Multi-venue live in M2.
 | Engine determinism | bit-for-bit identical across runs | M1 #21 (`cargo test`) |
 | Engine vs Python reference | `|Δσ²_30d| < 1e-6` | M1 #21 acceptance gate |
 | Public API p95 latency (REST `latest`) | < 50 ms | M1 #22-24 |
-| Public WS broadcast fan-out | 100 concurrent subs / instance | M2 sizing |
-| Index publish miss rate | < 0.1 % of expected 60s slots | M2 SLO |
+| Public WS broadcast fan-out | 100 concurrent subs / instance | future sizing |
+| Index publish miss rate | < 0.1 % of expected 60s slots | future SLO |
 
 ---
 
@@ -568,8 +568,10 @@ VolX is live on testnet.
 | --- | --- | --- | --- |
 | **M0** Research | Done | Python reference impl, validated math, DVOL gap diagnosed | **Complete** |
 | **M1** Local pipeline | Done | Rust ingest + engine → Go API → Next.js | **Complete** — full pipeline shipped, e2e smoke green |
-| **M2** Hardening | In progress | Multi-venue, on-chain perp, live deploy, CI/CD | Multi-venue + on-chain perp + always-on deploy shipped; API keys / status page pending |
-| **M3** Public launch | Pending M2 | Methodology page, aggregator listings, public dashboard | Methodology + dashboard live; aggregator listings pending |
+| **M2** Multi-venue & index quality | Done | OKX + Bybit connectors, per-venue strip + median blend, outlier drop, confidence score, per-service Docker | **Complete** — all 6 issues closed |
+| **On-chain perp** (testnet) | Done | VolXOracle + VolXPerpV2 + keeper + `/trade` `/pool` `/dashboard` wallet app on Sepolia | **Complete** — all 11 issues closed; live demo |
+| **Deploy & CI/CD** | Done | Always-on server (Docker Compose), Cloudflare Tunnel, Netlify, Docker Hub, GitHub Actions pull-deploy | **Complete** — live |
+| **M3** Public launch | In progress | Methodology page, public dashboard, aggregator listings | Methodology + dashboard live; aggregator submissions pending |
 
 ### What works today
 
@@ -595,10 +597,11 @@ VolX is live on testnet.
 
 ### What's next
 
-- API keys + auth-keyed rate-limit tiers (M2)
-- Public status page + backup/restore runbook (M2)
 - Aggregator submissions + public launch (M3)
 - Contract audit before any non-testnet use
+
+Future (not yet scoped): API keys + auth-keyed rate-limit tiers, public
+status page, backup/restore runbook, SLO monitoring.
 
 ---
 
@@ -668,9 +671,11 @@ M1 ✓  Local live pipeline
        ├── Engine numerical acceptance (#21)         ✓
        ├── Go API: REST + WS (#22-24)                ✓
        └── Next.js dashboard (#25-27)                ✓
-M2 ▶  Multi-venue ✓ · on-chain perp ✓ · always-on deploy + CI/CD ✓
-       └── API keys, status page, backups, SLO monitoring
-M3    Methodology page ✓ · public dashboard ✓ · aggregator submissions
+M2 ✓  Multi-venue & index quality (OKX + Bybit, median blend, outlier drop, confidence)
+On-chain perp ✓  VolXOracle + VolXPerpV2 + keeper + wallet app (Sepolia)
+Deploy + CI/CD ✓  always-on server, Cloudflare Tunnel, Netlify, Docker Hub
+M3 ▶  Methodology page ✓ · public dashboard ✓ · aggregator submissions
+Future  API keys · status page · backups · SLO monitoring (unscoped)
 ```
 
 ---
@@ -734,9 +739,9 @@ no real funds.** The threat surface is:
 - **Keeper key** — the oracle/order signer is a testnet key, held in
   GitHub Actions secrets / the server `.env` (mode 0600), never in the
   repo. Compromise affects testnet funds only.
-- **Ingestion auth keys** (M2 onwards, for `.raw` channels). Stored in
+- **Ingestion auth keys** (future, for `.raw` channels). Stored in
   Keychain / Vault / k8s secrets, never in env files or repo.
-- **API key issuance** (M2). Hashed at rest; rate-limited and per-key
+- **API key issuance** (future). Hashed at rest; rate-limited and per-key
   audit logged.
 - **Public dashboard** — backend behind a Cloudflare Tunnel (TLS,
   no inbound ports open on the server); frontend static on Netlify; no
