@@ -463,10 +463,10 @@ volx/
 │
 ├── docker/
 │   ├── docker-compose.yml           # local dev: ClickHouse + Redis
-│   └── docker-compose.prod.yml      # Oracle Cloud (M3)
+│   └── docker-compose.prod.yml      # full prod stack (self-hosted server)
 │
-├── deploy/                          # M3
-│   ├── oracle-cloud-init.sh
+├── deploy/                          # deploy assets
+│   ├── oracle-cloud-init.sh         # legacy cloud-init (unused; current deploy is server + Cloudflare)
 │   └── grafana-dashboards/
 │
 └── docs/
@@ -571,7 +571,7 @@ VolX is live on testnet.
 | **M2** Multi-venue & index quality | Done | OKX + Bybit connectors, per-venue strip + median blend, outlier drop, confidence score, per-service Docker | **Complete** — all 6 issues closed |
 | **On-chain perp** (testnet) | Done | VolXOracle + VolXPerpV2 + keeper + `/trade` `/pool` `/dashboard` wallet app on Sepolia | **Complete** — all 11 issues closed; live demo |
 | **Deploy & CI/CD** | Done | Always-on server (Docker Compose), Cloudflare Tunnel, Netlify, Docker Hub, GitHub Actions pull-deploy | **Complete** — live |
-| **M3** Public launch | In progress | Methodology page, public dashboard, aggregator listings | Methodology + dashboard live; aggregator submissions pending |
+| **M3** Public launch | Done | Methodology page, public dashboard, live public deploy | **Complete** — methodology + dashboard live; backend + frontend deployed |
 
 ### What works today
 
@@ -597,7 +597,6 @@ VolX is live on testnet.
 
 ### What's next
 
-- Aggregator submissions + public launch (M3)
 - Contract audit before any non-testnet use
 
 Future (not yet scoped): API keys + auth-keyed rate-limit tiers, public
@@ -674,7 +673,7 @@ M1 ✓  Local live pipeline
 M2 ✓  Multi-venue & index quality (OKX + Bybit, median blend, outlier drop, confidence)
 On-chain perp ✓  VolXOracle + VolXPerpV2 + keeper + wallet app (Sepolia)
 Deploy + CI/CD ✓  always-on server, Cloudflare Tunnel, Netlify, Docker Hub
-M3 ▶  Methodology page ✓ · public dashboard ✓ · aggregator submissions
+M3 ✓  Methodology page · public dashboard · live public deploy
 Future  API keys · status page · backups · SLO monitoring (unscoped)
 ```
 
