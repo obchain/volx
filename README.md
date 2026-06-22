@@ -8,7 +8,7 @@
 <p align="center">
   <a href="./METHODOLOGY.md">Methodology</a> ·
   <a href="#quickstart">Quickstart</a> ·
-  <a href="#api-planned">API</a> ·
+  <a href="#api">API</a> ·
   <a href="#roadmap">Roadmap</a> ·
   <a href="./CHANGELOG.md">Changelog</a>
 </p>
@@ -45,7 +45,7 @@
 - [Tech stack](#tech-stack)
 - [Quickstart](#quickstart)
 - [Repo layout](#repo-layout)
-- [API (planned)](#api-planned)
+- [API](#api)
 - [Data sources](#data-sources)
 - [Performance targets](#performance-targets)
 - [Project status](#project-status)
@@ -79,8 +79,8 @@ VolX is:
 - **Auditable.** Every published row carries a content-hash of the strip
   set that produced it (`strip_hash`), so any value can be reproduced from
   the raw tick archive.
-- **Exchange-neutral.** Starts with Deribit (dominant BTC + ETH options
-  venue); multi-venue median blending lands in M2.
+- **Exchange-neutral.** Multi-venue median blending across Deribit, OKX,
+  and Bybit (see [Multi-venue robustness](#multi-venue-robustness)).
 - **Self-hostable.** No paid data feeds, no API keys required to run the
   ingestion locally, no proprietary math.
 
@@ -321,7 +321,7 @@ publish — well under the 60 s cadence, even at M2 multi-venue load.
 | Frontend | **Next.js 15** (app router) + React 19 + Tailwind 4 + `lightweight-charts` | static-friendly, deterministic chart rendering |
 | Research | Python 3.14 + numpy + pandas + scipy + matplotlib + jupyter | the methodology was validated here before any Rust was written |
 | Lint policy | `unsafe_code = forbid`, clippy pedantic, `cargo fmt --check` | financial code; zero tolerance for memory bugs |
-| Deploy (M3) | Oracle Cloud Always Free + Cloudflare + Vercel Hobby + GHCR | $0/mo recurring; ~$1/yr domain |
+| Deploy | Self-hosted always-on server (Docker Compose) + Cloudflare Tunnel + Netlify + Docker Hub | always-on backend behind Cloudflare; static frontend on Netlify; images on Docker Hub, CI pull-deploys |
 
 Determinism, free-tier compatibility, and operational simplicity are the
 three non-negotiables.
@@ -477,9 +477,11 @@ volx/
 
 ---
 
-## API (planned)
+## API
 
-The Go API is M1 scope. Endpoints below are the planned public shape.
+The Go API is **live**. Public base URL:
+[`https://volx-api.ancilar.com`](https://volx-api.ancilar.com/v1/index/bvol/latest)
+(served from the always-on server, exposed via a Cloudflare Tunnel).
 
 ### REST
 
@@ -493,23 +495,24 @@ GET  /v1/options/strip                ?venue=deribit&asset=BTC&expiry=2026-06-30
 Example:
 
 ```bash
-curl https://api.volx.dev/v1/index/BVOL/latest
+curl https://volx-api.ancilar.com/v1/index/bvol/latest
 ```
 
 ```json
 {
-  "index_id":    "BVOL",
-  "value":       65.42,
-  "confidence":  0.97,
-  "strip_hash":  "9c7a…",
-  "ts":          "2026-05-25T12:00:00Z"
+  "index":                  "BVOL",
+  "value":                  39.15,
+  "confidence":             0.19,
+  "source_strip_hash":      "0x7b70e7a9…",
+  "ts":                     "2026-06-17T14:27:39Z",
+  "next_update_eta_seconds": 57
 }
 ```
 
 ### WebSocket
 
 ```
-wss://api.volx.dev/v1/stream
+wss://volx-api.ancilar.com/v1/stream
 ```
 
 Subscribe to one or more indices; receive `IndexValue` rows pushed on
@@ -521,8 +524,8 @@ every 60-second publish.
 < {"type":"index","data":{"index_id":"EVOL","value":71.10,"ts":"..."}}
 ```
 
-Free tier: 60 req/min REST, 1 concurrent WS. M2 introduces auth-keyed
-higher-tier limits.
+Rate limit: 60 req/min REST, 1 concurrent WS. Auth-keyed higher-tier
+limits land in M2.
 
 ---
 
@@ -558,25 +561,32 @@ No paid feeds in v1. Multi-venue live in M2.
 
 ## Project status
 
-VolX is in active development.
+VolX is live on testnet.
 
 | Phase | Window | Deliverable | State |
 | --- | --- | --- | --- |
 | **M0** Research | Done | Python reference impl, validated math, DVOL gap diagnosed | **Complete** |
-| **M1** Local pipeline | In progress | Rust ingest + engine → Go API → Next.js | Ingestion + reconnect shipped |
-| **M2** Hardening | Pending M1 | Multi-venue, API keys, rate limit, status page, backups | Not started |
-| **M3** Public launch | Pending M2 | Methodology page, aggregator listings, public dashboard | Not started |
+| **M1** Local pipeline | Done | Rust ingest + engine → Go API → Next.js | **Complete** — full pipeline shipped, e2e smoke green |
+| **M2** Hardening | In progress | Multi-venue, on-chain perp, live deploy, CI/CD | Multi-venue + on-chain perp + always-on deploy shipped; API keys / status page pending |
+| **M3** Public launch | Pending M2 | Methodology page, aggregator listings, public dashboard | Methodology + dashboard live; aggregator listings pending |
 
 ### What works today
 
-- **`volx-ingestion`** — live Deribit WebSocket connector with REST
-  instrument discovery, batched subscribe, ticker → `OptionTick`
-  normalisation, reconnect + exponential backoff (1 → 2 → 4 → 8 → 16 s,
-  cap 30 s, ±20 % jitter), per-venue task isolation.
-- **`volx-shared-types`** — `OptionTick`, `Strip`, `StripQuote`,
-  `IndexValue`, `StripHash`, `Years`, `Minutes` and the venue/asset/kind
-  enums. All serde-round-trip-tested; domain invariants enforced at
-  deserialize time.
+- **Full off-chain pipeline, live** — `volx-ingestion` (multi-venue
+  Deribit/OKX/Bybit WS connectors, reconnect + backoff, per-venue
+  isolation) → `volx-normalizer` (staleness/spread/intrinsic filters +
+  ClickHouse persistence) → `volx-engine` (per-venue strip, Carr-Madan
+  variance integral, 30-day interpolation, median blend, outlier drop,
+  confidence score) → Go/Fiber API (REST `/v1/{latest,history,options/strip}`
+  + WS `/v1/stream`) → Next.js dashboard.
+- **Live public API + frontend** — backend at
+  [`volx-api.ancilar.com`](https://volx-api.ancilar.com/v1/index/bvol/latest)
+  (always-on server behind a Cloudflare Tunnel), frontend at
+  [`volx-frontend-29824.netlify.app`](https://volx-frontend-29824.netlify.app).
+- **On-chain perp on Sepolia** — VolXOracle + VolXPerpV2 + keeper +
+  `/trade` `/pool` `/dashboard` wallet app. See the on-chain section above.
+- **CI/CD** — GitHub Actions builds + pushes images to Docker Hub, then
+  pull-deploys to the server over a Cloudflare-Access SSH tunnel.
 - **Python reference impl** — fitted-IV variant adopted as canonical;
   matches DVOL within 5.83 % median absolute relative error (the +5.77 %
   bias is a structural inverse-contract artefact, not a math error — see
@@ -584,12 +594,10 @@ VolX is in active development.
 
 ### What's next
 
-- `normalizer` filters (#12) + ClickHouse writer (#15, #16)
-- `engine` strip builder (#17), variance integral (#18), 30-day interp
-  (#19), scheduler (#20)
-- Go API skeleton (#22) → endpoints (#23) → WebSocket stream (#24)
-- Next.js scaffold (#25) → landing (#26) → live chart (#27)
-- CI (#28)
+- API keys + auth-keyed rate-limit tiers (M2)
+- Public status page + backup/restore runbook (M2)
+- Aggregator submissions + public launch (M3)
+- Contract audit before any non-testnet use
 
 ---
 
@@ -648,19 +656,20 @@ High-level landmarks:
 
 ```
 M0 ✓  Research + math reference + DVOL diagnosis
-M1    Local live pipeline
+M1 ✓  Local live pipeline
        ├── Rust workspace skeleton (#7)              ✓
        ├── shared-types (#8)                         ✓
        ├── Ingestion: Deribit WS (#9)                ✓
-       ├── Reconnect + backoff (#10)                 ▶  (this milestone)
-       ├── Tracing + Prometheus (#11)
-       ├── Normalizer filters + ClickHouse (#12-16)
-       ├── Engine: strip / variance / interp / cron (#17-20)
-       ├── Engine numerical acceptance (#21)
-       ├── Go API: REST + WS (#22-24)
-       └── Next.js dashboard (#25-27)
-M2    Multi-venue, API keys, status page, backups, SLO monitoring
-M3    Methodology page, aggregator submissions, public launch
+       ├── Reconnect + backoff (#10)                 ✓
+       ├── Tracing + Prometheus (#11)                ✓
+       ├── Normalizer filters + ClickHouse (#12-16)  ✓
+       ├── Engine: strip / variance / interp / cron (#17-20)  ✓
+       ├── Engine numerical acceptance (#21)         ✓
+       ├── Go API: REST + WS (#22-24)                ✓
+       └── Next.js dashboard (#25-27)                ✓
+M2 ▶  Multi-venue ✓ · on-chain perp ✓ · always-on deploy + CI/CD ✓
+       └── API keys, status page, backups, SLO monitoring
+M3    Methodology page ✓ · public dashboard ✓ · aggregator submissions
 ```
 
 ---
@@ -712,15 +721,25 @@ notebooks within `1e-6` in `σ²_30d` to ship.
 
 ## Security
 
-VolX is read-only software at v1: no on-chain components, no wallet code,
-no user funds custody, no auth-token issuance. The threat surface is:
+The off-chain index pipeline is read-only software (no user funds custody,
+no auth-token issuance). The on-chain perp adds a smart-contract surface,
+**deployed to Ethereum Sepolia testnet only — not audited, demo liquidity,
+no real funds.** The threat surface is:
 
+- **On-chain contracts** (testnet). `unsafe`-free off-chain code;
+  contracts are `VolXOracle` + `VolXPerpV2` + `MockUSDC` on Sepolia.
+  **Not audited — do not deploy to mainnet or fund with real assets.**
+  See [`docs/onchain-demo.md`](./docs/onchain-demo.md) for addresses.
+- **Keeper key** — the oracle/order signer is a testnet key, held in
+  GitHub Actions secrets / the server `.env` (mode 0600), never in the
+  repo. Compromise affects testnet funds only.
 - **Ingestion auth keys** (M2 onwards, for `.raw` channels). Stored in
   Keychain / Vault / k8s secrets, never in env files or repo.
 - **API key issuance** (M2). Hashed at rest; rate-limited and per-key
   audit logged.
-- **Public dashboard** (M3). Cloudflare WAF + Caddy TLS; no PII
-  collected.
+- **Public dashboard** — backend behind a Cloudflare Tunnel (TLS,
+  no inbound ports open on the server); frontend static on Netlify; no
+  PII collected.
 
 To report a vulnerability privately: open a security advisory on GitHub
 (`obchain/volx` → Security → Report a vulnerability) rather than a public
